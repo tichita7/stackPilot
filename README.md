@@ -112,7 +112,7 @@ stackPilot/
 ### Clone Repository
 
 ```bash
-git clone https://github.com/tichita7/stackpilot.git
+git clone https://github.com/tichita7/stackPilot.git
 cd stackpilot
 ```
 
@@ -163,8 +163,6 @@ cd server
 
 uvicorn main:app --reload
 ```
-
-depending on your backend entry file.
 
 ---
 
