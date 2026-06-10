@@ -28,7 +28,9 @@ const RepositoryCopilot = () => {
   useEffect(() => {
     document.title = "StackPilot - Repository Copilot";
     if (!user) return;
-    fetch(`http://localhost:8000/api/dashboard-analytics/${user.id}`)
+    fetch(
+      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
+    )
       .then((res) => res.json())
       .then((data) => {
         if (data && data.time_series_7d) {
@@ -49,7 +51,7 @@ const RepositoryCopilot = () => {
 
     try {
       const response = await fetch(
-        "http://localhost:8000/api/repository-copilot",
+        "https://stackpilot-oom6.onrender.com/api/repository-copilot",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

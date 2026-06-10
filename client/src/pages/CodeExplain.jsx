@@ -39,15 +39,18 @@ const CodeExplain = () => {
     setResult(null);
 
     try {
-      const response = await fetch("http://localhost:8000/api/explain", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code: code,
-          language: language || "Auto-detect",
-          clerk_id: user?.id || "",
-        }),
-      });
+      const response = await fetch(
+        "https://stackpilot-oom6.onrender.com/api/explain",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: code,
+            language: language || "Auto-detect",
+            clerk_id: user?.id || "",
+          }),
+        },
+      );
 
       if (!response.ok) throw new Error("Backend connection failed.");
       const data = await response.json();

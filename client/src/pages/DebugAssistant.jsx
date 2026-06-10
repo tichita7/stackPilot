@@ -30,7 +30,9 @@ const DebugAssistant = () => {
   useEffect(() => {
     document.title = "StackPilot - Debug Assistant";
     if (!user) return;
-    fetch(`http://localhost:8000/api/dashboard-analytics/${user.id}`)
+    fetch(
+      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
+    )
       .then((res) => res.json())
       .then((data) => {
         if (data && data.time_series_7d) {
@@ -50,16 +52,19 @@ const DebugAssistant = () => {
     setResult(null);
 
     try {
-      const response = await fetch("http://localhost:8000/api/debug", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code: code,
-          error: errorLog,
-          language: language || "Auto-detect",
-          clerk_id: user?.id || "",
-        }),
-      });
+      const response = await fetch(
+        "https://stackpilot-oom6.onrender.com/api/debug-assistant",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: code,
+            error: errorLog,
+            language: language || "Auto-detect",
+            clerk_id: user?.id || "",
+          }),
+        },
+      );
 
       if (!response.ok)
         throw new Error("Telemetry validation diagnostic failure.");

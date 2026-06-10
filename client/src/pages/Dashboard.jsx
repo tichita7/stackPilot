@@ -15,7 +15,9 @@ const Dashboard = () => {
     document.title = "StackPilot - Dashboard";
     if (!user) return;
 
-    fetch(`http://localhost:8000/api/dashboard-analytics/${user.id}`)
+    fetch(
+      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
+    )
       .then((res) => {
         if (!res.ok)
           throw new Error(`Backend telemetry engine failure: ${res.status}`);

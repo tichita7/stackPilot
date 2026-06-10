@@ -28,7 +28,9 @@ const ReviewResume = () => {
   useEffect(() => {
     document.title = "StackPilot - Review Resume";
     if (!user) return;
-    fetch(`http://localhost:8000/api/dashboard-analytics/${user.id}`)
+    fetch(
+      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
+    )
       .then((res) => res.json())
       .then((data) => {
         if (data && data.time_series_7d) {
@@ -52,10 +54,13 @@ const ReviewResume = () => {
     formData.append("clerk_id", user?.id || "");
 
     try {
-      const response = await fetch("http://localhost:8000/api/review-resume", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await fetch(
+        "https://stackpilot-oom6.onrender.com/api/review-resume",
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
 
       if (!response.ok) throw new Error("Resume parsing service unavailable.");
       const data = await response.json();

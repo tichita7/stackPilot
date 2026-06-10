@@ -266,7 +266,7 @@ async def get_dashboard_analytics(clerk_id: str):
 
 
 # ── Debug ────────────────────────────────────────────────
-@app.post("/api/debug")
+@app.post("/api/debug-assistant")
 async def debug(req: DebugRequest):
     system_message = {
         "role": "system",
