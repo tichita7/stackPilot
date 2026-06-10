@@ -113,7 +113,7 @@ stackPilot/
 
 ```bash
 git clone https://github.com/tichita7/stackPilot.git
-cd stackpilot
+cd stackPilot
 ```
 
 ### Install Frontend Dependencies
