@@ -338,7 +338,7 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
 
 
 # ── Resume Review ─────────────────────────────────────────
-@app.post("/api/resume")
+@app.post("/api/review-resume")
 async def review_resume(clerk_id: str = Form(""), file: UploadFile = File(...)):
     pdf_bytes = await file.read()
     reader = PdfReader(BytesIO(pdf_bytes))
