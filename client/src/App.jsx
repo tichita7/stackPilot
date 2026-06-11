@@ -30,7 +30,12 @@ const App = () => {
       <Route path="/sign-up" element={<SignUpPage />} />
       <Route
         path="/sso-callback"
-        element={<AuthenticateWithRedirectCallback />}
+        element={
+          <AuthenticateWithRedirectCallback
+            signInForceRedirectUrl="/ai"
+            signUpForceRedirectUrl="/ai"
+          />
+        }
       />
 
       {/* PROTECTED */}
