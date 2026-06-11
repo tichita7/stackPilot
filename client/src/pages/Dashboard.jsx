@@ -10,31 +10,33 @@ const Dashboard = () => {
   const { user } = useUser();
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [slowLoad, setSlowLoad] = useState(false);
 
   useEffect(() => {
     document.title = "StackPilot - Dashboard";
     if (!user) return;
 
+    const slowTimer = setTimeout(() => setSlowLoad(true), 8000);
+
     fetch(
       `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
     )
       .then((res) => {
-        if (!res.ok)
-          throw new Error(`Backend telemetry engine failure: ${res.status}`);
+        if (!res.ok) throw new Error(`${res.status}`);
         return res.json();
       })
       .then((data) => {
-        if (data && data.metrics) {
-          setAnalytics(data);
-        } else {
-          throw new Error("Telemetry validation structural mismatch.");
-        }
+        clearTimeout(slowTimer);
+        if (data && data.metrics) setAnalytics(data);
         setLoading(false);
       })
       .catch((err) => {
-        console.error("Telemetry pipeline execution error:", err);
+        clearTimeout(slowTimer);
+        console.error(err);
         setLoading(false);
       });
+
+    return () => clearTimeout(slowTimer);
   }, [user]);
 
   const F = { fontFamily: "'DM Mono', monospace" };
@@ -50,16 +52,33 @@ const Dashboard = () => {
     return (
       <div
         style={{
-          background: BG,
+          background: "#252523",
           minHeight: "100vh",
           display: "flex",
+          flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
-          color: ACCENT,
-          ...F,
+          gap: 12,
+          fontFamily: "'DM Mono', monospace",
         }}
       >
-        LOADING TELEMETRY CORE CONTROL ENGINE...
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="#0b880d"
+          strokeWidth="2"
+          style={{ animation: "spin 0.8s linear infinite" }}
+        >
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+        </svg>
+        <div style={{ color: "#0b880d", fontSize: 13 }}>
+          {slowLoad
+            ? "Backend waking up... (~30s on first load)"
+            : "LOADING WORKSPACE..."}
+        </div>
       </div>
     );
   }
