@@ -129,8 +129,8 @@ const SignInPage = () => {
     try {
       await signIn.authenticateWithRedirect({
         strategy: `oauth_${provider}`,
-        redirectUrl: `${window.location.origin}/sso-callback`,
-        redirectUrlComplete: from,
+        redirectUrl: `https://stack-pilot-agentic.vercel.app/sso-callback`,
+        redirectUrlComplete: `https://stack-pilot-agentic.vercel.app/ai`,
       });
     } catch (err) {
       setError(`Could not sign in with ${provider}. Please try again.`);
