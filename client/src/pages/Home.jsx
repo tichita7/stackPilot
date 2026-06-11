@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AiToolsData } from "../assets/assets";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
-
 import CustomUserMenu from "../components/CustomUserMenu";
 
 const FAQItem = ({ q, a, BG, INK, INK2, BORDER, ACCENT, F }) => {
@@ -71,7 +71,7 @@ const FAQItem = ({ q, a, BG, INK, INK2, BORDER, ACCENT, F }) => {
 
 const Home = () => {
   const navigate = useNavigate();
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const toolsRef = useRef(null);
   const terminalRef = useRef(null);
   const heroRef = useRef(null);
@@ -81,6 +81,11 @@ const Home = () => {
   const [terminalActive, setTerminalActive] = useState(false);
   const [visibleStats, setVisibleStats] = useState(false);
   const statsRef = useRef(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
 
   const handleGetStarted = () => {
     if (user) navigate("/ai");
@@ -480,7 +485,7 @@ const Home = () => {
               No credit card required.
             </p>
             <div style={{ display: "flex", gap: 6 }}>
-              {["Groq", "Clerk", "FastAPI"].map((t) => (
+              {["Groq", "Firebase", "FastAPI"].map((t) => (
                 <span
                   key={t}
                   style={{
@@ -864,7 +869,6 @@ const Home = () => {
                   transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
                 }}
               >
-                {/* Accent line on hover */}
                 <div
                   style={{
                     position: "absolute",
@@ -1155,7 +1159,7 @@ const Home = () => {
       >
         <NavLogo />
         <div style={{ ...F, fontSize: 10, color: INK2 }}>
-          React · FastAPI · Groq · Clerk
+          React · FastAPI · Groq · Firebase
         </div>
         <div style={{ ...F, fontSize: 10, color: INK2 }}>©2026 StackPilot</div>
       </footer>

@@ -1,6 +1,7 @@
-import React from "react";
-import { useUser, AuthenticateWithRedirectCallback } from "@clerk/clerk-react";
+import React, { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "./firebase";
 
 import SignInPage from "./pages/SignInPage";
 import SignUpPage from "./pages/SignUpPage";
@@ -11,38 +12,50 @@ import CodeExplain from "./pages/CodeExplain";
 import ReviewResume from "./pages/ReviewResume";
 import RepositoryCopilot from "./pages/RepositoryCopilot";
 
-const ProtectedRoute = ({ children }) => {
-  const { isSignedIn, isLoaded } = useUser();
+const ProtectedRoute = ({ user, loaded, children }) => {
   const location = useLocation();
-  if (!isLoaded) return null;
-  if (!isSignedIn) {
+  if (!loaded)
+    return (
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          height: "100vh",
+        }}
+      >
+        <span>Loading...</span>
+      </div>
+    );
+  if (!user)
     return <Navigate to="/sign-in" state={{ from: location }} replace />;
-  }
   return children;
 };
 
 const App = () => {
+  const [user, setUser] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setLoaded(true);
+    });
+    return () => unsub();
+  }, []);
+
   return (
     <Routes>
       {/* PUBLIC */}
       <Route path="/" element={<Home />} />
       <Route path="/sign-in" element={<SignInPage />} />
       <Route path="/sign-up" element={<SignUpPage />} />
-      <Route
-        path="/sso-callback"
-        element={
-          <AuthenticateWithRedirectCallback
-            signInForceRedirectUrl="/ai"
-            signUpForceRedirectUrl="/ai"
-          />
-        }
-      />
 
       {/* PROTECTED */}
       <Route
         path="/ai"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute user={user} loaded={loaded}>
             <Dashboard />
           </ProtectedRoute>
         }
@@ -50,7 +63,7 @@ const App = () => {
       <Route
         path="/ai/repository-copilot"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute user={user} loaded={loaded}>
             <RepositoryCopilot />
           </ProtectedRoute>
         }
@@ -58,7 +71,7 @@ const App = () => {
       <Route
         path="/ai/code-explain"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute user={user} loaded={loaded}>
             <CodeExplain />
           </ProtectedRoute>
         }
@@ -66,7 +79,7 @@ const App = () => {
       <Route
         path="/ai/debug-assistant"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute user={user} loaded={loaded}>
             <DebugAssistant />
           </ProtectedRoute>
         }
@@ -74,12 +87,11 @@ const App = () => {
       <Route
         path="/ai/review-resume"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute user={user} loaded={loaded}>
             <ReviewResume />
           </ProtectedRoute>
         }
       />
-
       {/* FALLBACK */}
       <Route path="*" element={<Navigate to="/" />} />
     </Routes>

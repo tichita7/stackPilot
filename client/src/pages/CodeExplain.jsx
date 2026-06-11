@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from "react";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
-
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
 const CodeExplain = () => {
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const navigate = useNavigate();
 
   const [code, setCode] = useState("");
@@ -18,6 +18,8 @@ const CodeExplain = () => {
 
   useEffect(() => {
     document.title = "StackPilot - Code Explain";
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
   }, []);
 
   const F = { fontFamily: "'DM Mono', monospace" };
@@ -28,7 +30,7 @@ const CodeExplain = () => {
   const BORDER = "#2a2a28";
   const TECH_BLUE = "#00d2ff";
   const SUCCESS_GREEN = "#4ade80";
-  const PURPLE_ACCENT = "#d86ce6"; // specific brand color for this tool
+  const PURPLE_ACCENT = "#d86ce6";
 
   const handleAnalyze = async (e) => {
     e?.preventDefault();
@@ -39,15 +41,18 @@ const CodeExplain = () => {
     setResult(null);
 
     try {
+      const idToken = auth.currentUser
+        ? await auth.currentUser.getIdToken()
+        : "";
       const response = await fetch(
-        "https://stackpilot-oom6.onrender.com/api/explain",
+        "https://stackpilot-oom6.onrender.com/api/code-explain",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             code: code,
             language: language || "Auto-detect",
-            clerk_id: user?.id || "",
+            id_token: idToken,
           }),
         },
       );
@@ -351,7 +356,6 @@ const CodeExplain = () => {
             </div>
 
             <div style={{ padding: 32 }}>
-              {/* 1. Overview */}
               {activeTab === "overview" && (
                 <div>
                   <h3
@@ -367,7 +371,6 @@ const CodeExplain = () => {
                 </div>
               )}
 
-              {/* 2. Breakdown */}
               {activeTab === "breakdown" && (
                 <div>
                   <h3
@@ -419,7 +422,6 @@ const CodeExplain = () => {
                 </div>
               )}
 
-              {/* 3. Complexity */}
               {activeTab === "complexity" && (
                 <div>
                   <h3
@@ -502,7 +504,6 @@ const CodeExplain = () => {
                 </div>
               )}
 
-              {/* 4. Improvements */}
               {activeTab === "improvements" && (
                 <div>
                   <h3

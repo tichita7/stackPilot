@@ -1,16 +1,17 @@
 import React, { useState, useRef, useEffect } from "react";
-import { useClerk } from "@clerk/clerk-react";
+import { signOut } from "firebase/auth";
+import { auth } from "../firebase";
+import { useNavigate } from "react-router-dom";
 
-const BG = "#131312";
 const INK = "#F5F2EB";
 const INK2 = "#9b9b98";
 const BORDER = "#2a2a28";
 const ACCENT = "#E8572A";
 
 const CustomUserMenu = ({ user }) => {
-  const { signOut } = useClerk();
   const [open, setOpen] = useState(false);
   const ref = useRef();
+  const navigate = useNavigate();
 
   useEffect(() => {
     const handler = (e) => {
@@ -21,6 +22,11 @@ const CustomUserMenu = ({ user }) => {
   }, []);
 
   if (!user) return null;
+
+  const handleSignOut = async () => {
+    await signOut(auth);
+    navigate("/");
+  };
 
   return (
     <div ref={ref} style={{ position: "relative" }}>
@@ -41,8 +47,11 @@ const CustomUserMenu = ({ user }) => {
         onMouseLeave={(e) => (e.currentTarget.style.borderColor = BORDER)}
       >
         <img
-          src={user.imageUrl}
-          alt={user.fullName}
+          src={
+            user.photoURL ||
+            `https://ui-avatars.com/api/?name=${user.displayName}&background=2a63e8&color=fff`
+          }
+          alt={user.displayName}
           style={{
             width: 26,
             height: 26,
@@ -58,7 +67,7 @@ const CustomUserMenu = ({ user }) => {
             color: INK,
           }}
         >
-          {user.firstName}
+          {user.displayName?.split(" ")[0] || "User"}
         </span>
         <svg
           width="11"
@@ -91,7 +100,6 @@ const CustomUserMenu = ({ user }) => {
             overflow: "hidden",
           }}
         >
-          {/* User info */}
           <div
             style={{
               padding: "14px 16px",
@@ -102,8 +110,11 @@ const CustomUserMenu = ({ user }) => {
             }}
           >
             <img
-              src={user.imageUrl}
-              alt={user.fullName}
+              src={
+                user.photoURL ||
+                `https://ui-avatars.com/api/?name=${user.displayName}&background=2a63e8&color=fff`
+              }
+              alt={user.displayName}
               style={{
                 width: 34,
                 height: 34,
@@ -120,7 +131,7 @@ const CustomUserMenu = ({ user }) => {
                   color: INK,
                 }}
               >
-                {user.fullName}
+                {user.displayName || "User"}
               </div>
               <div
                 style={{
@@ -130,14 +141,12 @@ const CustomUserMenu = ({ user }) => {
                   marginTop: 2,
                 }}
               >
-                {user.primaryEmailAddress?.emailAddress}
+                {user.email}
               </div>
             </div>
           </div>
-
-          {/* Sign out */}
           <button
-            onClick={() => signOut({ redirectUrl: "/" })}
+            onClick={handleSignOut}
             style={{
               width: "100%",
               padding: "11px 16px",

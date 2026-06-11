@@ -1,41 +1,70 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
-
 import CustomUserMenu from "../components/CustomUserMenu";
 
 const Dashboard = () => {
   const navigate = useNavigate();
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [slowLoad, setSlowLoad] = useState(false);
 
+  // Effect 1: listen to Firebase auth state
   useEffect(() => {
     document.title = "StackPilot - Dashboard";
+    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      if (!firebaseUser) setLoading(false);
+    });
+    return () => unsub();
+  }, []);
+
+  // Effect 2: sync + fetch analytics
+  useEffect(() => {
     if (!user) return;
 
     const slowTimer = setTimeout(() => setSlowLoad(true), 8000);
 
-    fetch(
-      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
-    )
-      .then((res) => {
+    const fetchData = async () => {
+      try {
+        const idToken = await auth.currentUser.getIdToken();
+
+        // ✅ Fire sync in background — don't await it, don't let it block
+        fetch("https://stackpilot-oom6.onrender.com/api/sync-user", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id_token: idToken,
+            email: user.email || "",
+            name: user.displayName || "",
+          }),
+        }).catch(() => {}); // intentionally silent
+
+        // ✅ Fetch analytics immediately, parallel to sync
+        const res = await fetch(
+          `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.uid}`,
+          {
+            headers: {
+              Authorization: `Bearer ${idToken}`,
+            },
+          },
+        );
         if (!res.ok) throw new Error(`${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
+        const data = await res.json();
         clearTimeout(slowTimer);
         if (data && data.metrics) setAnalytics(data);
         setLoading(false);
-      })
-      .catch((err) => {
+      } catch (err) {
         clearTimeout(slowTimer);
         console.error(err);
         setLoading(false);
-      });
+      }
+    };
 
+    fetchData();
     return () => clearTimeout(slowTimer);
   }, [user]);
 
@@ -48,7 +77,8 @@ const Dashboard = () => {
   const ACCENT = "#0b880d";
   const TECH_BLUE = "#395aa6";
 
-  if (loading || !analytics) {
+  // ✅ Only block on loading — not on empty analytics
+  if (loading) {
     return (
       <div
         style={{
@@ -82,6 +112,27 @@ const Dashboard = () => {
       </div>
     );
   }
+
+  // ✅ Empty state — shown when analytics is null (new user, no sessions yet)
+  const emptyAnalytics = {
+    time_series_7d: [
+      { day: "Mon", total: 0 },
+      { day: "Tue", total: 0 },
+      { day: "Wed", total: 0 },
+      { day: "Thu", total: 0 },
+      { day: "Fri", total: 0 },
+      { day: "Sat", total: 0 },
+      { day: "Sun", total: 0 },
+    ],
+    telemetry_stream: [],
+    metrics: {
+      favorite_assistant: "None (0 runs)",
+      workspace_momentum: "+0% growth vs last cycle",
+      streak_count: "0 Days Active",
+    },
+  };
+
+  const data = analytics || emptyAnalytics;
 
   return (
     <div
@@ -144,26 +195,6 @@ const Dashboard = () => {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
-          {/* <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              ...F,
-              fontSize: 12,
-              color: "#4ade80",
-            }}
-          >
-            <span
-              style={{
-                width: 6,
-                height: 6,
-                background: "#4ade80",
-                borderRadius: "50%",
-              }}
-            />
-            {analytics.metrics.streak_count}
-          </div> */}
           <div
             style={{
               display: "flex",
@@ -175,7 +206,7 @@ const Dashboard = () => {
           >
             <div style={{ textAlign: "right" }}>
               <div style={{ fontSize: 13, fontWeight: 700 }}>
-                {user?.fullName || "Alex Rivera"}
+                {user?.displayName || user?.email?.split("@")[0] || "Developer"}
               </div>
               <div
                 style={{
@@ -246,6 +277,7 @@ const Dashboard = () => {
             alignItems: "start",
           }}
         >
+          {/* Chart */}
           <div
             style={{
               background: PANEL_BG,
@@ -296,17 +328,14 @@ const Dashboard = () => {
                 marginBottom: 16,
               }}
             >
-              {analytics.time_series_7d.map((dayData, idx) => {
-                // Backend now sends { day, total } — single total count per day
+              {data.time_series_7d.map((dayData, idx) => {
                 const totalRuns = dayData.total || 0;
                 const maxRuns = Math.max(
-                  ...analytics.time_series_7d.map((d) => d.total || 0),
+                  ...data.time_series_7d.map((d) => d.total || 0),
                   1,
                 );
-                // Scale bar height: min 8px baseline, max 180px
                 const calculatedHeight =
                   totalRuns > 0 ? Math.max((totalRuns / maxRuns) * 180, 18) : 8;
-
                 return (
                   <div
                     key={idx}
@@ -413,7 +442,9 @@ const Dashboard = () => {
             </div>
           </div>
 
+          {/* Right column */}
           <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+            {/* Favorite Assistant */}
             <div
               style={{
                 background: PANEL_BG,
@@ -452,13 +483,14 @@ const Dashboard = () => {
                     borderRadius: "50%",
                   }}
                 />
-                {analytics.metrics.favorite_assistant.split(" (")[0]}
+                {data.metrics.favorite_assistant.split(" (")[0]}
               </div>
               <div style={{ ...F, fontSize: 12, color: INK, marginTop: 4 }}>
                 Responsible for dominant query volume.
               </div>
             </div>
 
+            {/* Workspace Momentum */}
             <div
               style={{
                 background: PANEL_BG,
@@ -486,13 +518,14 @@ const Dashboard = () => {
                   letterSpacing: "-1px",
                 }}
               >
-                {analytics.metrics.workspace_momentum.split(" ")[0]}
+                {data.metrics.workspace_momentum.split(" ")[0]}
               </div>
               <div style={{ fontSize: 12, color: INK, marginTop: 2 }}>
                 Efficiency increase across nodes vs previous cycle.
               </div>
             </div>
 
+            {/* Recent Telemetry */}
             <div
               style={{
                 background: PANEL_BG,
@@ -513,62 +546,80 @@ const Dashboard = () => {
               >
                 Recent Telemetry
               </div>
-              <div
-                style={{ display: "flex", flexDirection: "column", gap: 12 }}
-              >
-                {analytics.telemetry_stream.map((log, idx) => (
-                  <div
-                    key={idx}
-                    style={{
-                      background: "#131312",
-                      border: `1px solid #222`,
-                      borderRadius: 8,
-                      padding: "10px 12px",
-                    }}
-                  >
+
+              {data.telemetry_stream.length === 0 ? (
+                <div
+                  style={{
+                    ...F,
+                    fontSize: 12,
+                    color: INK2,
+                    textAlign: "center",
+                    padding: "20px 0",
+                  }}
+                >
+                  No sessions yet. Use a tool to see activity here.
+                </div>
+              ) : (
+                <div
+                  style={{ display: "flex", flexDirection: "column", gap: 12 }}
+                >
+                  {data.telemetry_stream.map((log, idx) => (
                     <div
+                      key={idx}
                       style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        marginBottom: 6,
+                        background: "#131312",
+                        border: `1px solid #222`,
+                        borderRadius: 8,
+                        padding: "10px 12px",
                       }}
                     >
-                      <span
+                      <div
                         style={{
-                          ...F,
-                          fontSize: 11,
-                          fontWeight: 700,
-                          color: TECH_BLUE,
-                          textTransform: "uppercase",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          marginBottom: 6,
                         }}
                       >
-                        {log.tool.replace("-", " ")}
-                      </span>
-                      <span style={{ ...F, fontSize: 9, color: INK2 }}>
-                        {new Date(log.created_at).toLocaleTimeString("en-IN", {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                          second: "2-digit",
-                          timeZone: "Asia/Kolkata",
-                        })}
-                      </span>
+                        <span
+                          style={{
+                            ...F,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            color: TECH_BLUE,
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          {log.tool.replace("-", " ")}
+                        </span>
+                        <span style={{ ...F, fontSize: 9, color: INK2 }}>
+                          {new Date(log.created_at).toLocaleTimeString(
+                            "en-IN",
+                            {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                              timeZone: "Asia/Kolkata",
+                            },
+                          )}
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          fontSize: 12,
+                          color: "#dddddd",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {log.input_summary ||
+                          "Operational payload execution sequence dispatched."}
+                      </div>
                     </div>
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: "#dddddd",
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {log.input_summary ||
-                        "Operational payload execution sequence dispatched."}
-                    </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>

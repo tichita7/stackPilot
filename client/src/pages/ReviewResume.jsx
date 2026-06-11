@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from "react";
-import { useUser } from "@clerk/clerk-react";
-import NavLogo from "../components/NavLogo";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 
+import NavLogo from "../components/NavLogo";
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
 const ReviewResume = () => {
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const navigate = useNavigate();
 
   const [file, setFile] = useState(null);
@@ -23,23 +24,13 @@ const ReviewResume = () => {
   const BORDER = "#2a2a28";
   const TECH_BLUE = "#00d2ff";
   const SUCCESS_GREEN = "#4ade80";
-  const GOLD_ACCENT = "#eab308"; // Brand color for resume quality
+  const GOLD_ACCENT = "#eab308";
 
   useEffect(() => {
     document.title = "StackPilot - Review Resume";
-    if (!user) return;
-    fetch(
-      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
-    )
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.time_series_7d) {
-          const todayData = data.time_series_7d[data.time_series_7d.length - 1];
-          const todayResumeRuns = todayData["review-resume"] || 0;
-        }
-      })
-      .catch((err) => console.error("Failed to sync tool telemetry:", err));
-  }, [user]);
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
 
   const handleUpload = async (e) => {
     e?.preventDefault();
@@ -49,11 +40,14 @@ const ReviewResume = () => {
     setError(null);
     setResult(null);
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("clerk_id", user?.id || "");
-
     try {
+      const idToken = auth.currentUser
+        ? await auth.currentUser.getIdToken()
+        : "";
+      const formData = new FormData(); // ✅ formData after idToken
+      formData.append("file", file);
+      formData.append("id_token", idToken);
+
       const response = await fetch(
         "https://stackpilot-oom6.onrender.com/api/review-resume",
         {
@@ -93,7 +87,6 @@ const ReviewResume = () => {
         fontFamily: "'Syne', sans-serif",
       }}
     >
-      {/* ── CUSTOM DARK NAVBAR ──────────────────────────────────────── */}
       <nav
         style={{
           display: "flex",
@@ -156,7 +149,6 @@ const ReviewResume = () => {
         </div>
       </nav>
 
-      {/* ── CONTENT ──────────────────────────────────────────────────── */}
       <div style={{ maxWidth: 800, margin: "0 auto" }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
           <h1
@@ -237,7 +229,6 @@ const ReviewResume = () => {
           )}
         </div>
 
-        {/* Output Results */}
         {result && (
           <div
             style={{

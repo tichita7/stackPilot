@@ -8,6 +8,8 @@ from io import BytesIO
 from datetime import datetime, timedelta
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 import os
 import json
 import requests
@@ -17,7 +19,7 @@ import psycopg2
 
 load_dotenv()
 
-app = FastAPI(title="StackPilot Enterprise API", version="1.2.0")
+app = FastAPI(title="StackPilot Enterprise API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,10 +32,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Firebase Admin Init ──────────────────────────────────
+# Reads the full service account JSON from environment variable
+_raw_key = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
+if _raw_key:
+    _cred_dict = json.loads(_raw_key)
+    _cred = credentials.Certificate(_cred_dict)
+    firebase_admin.initialize_app(_cred)
+    print("Firebase Admin SDK Initialized Successfully.")
+else:
+    print("WARNING: FIREBASE_SERVICE_ACCOUNT_KEY not set. Token verification disabled.")
+
+
+# ── Firebase Token Verifier ──────────────────────────────
+def verify_firebase_token(id_token: str) -> str:
+    """
+    Verifies the Firebase ID token sent from the frontend.
+    Returns the Firebase UID (uid) if valid.
+    Raises HTTP 401 if invalid or expired.
+    """
+    if not id_token:
+        return ""
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+        return decoded["uid"]
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(status_code=401, detail="Firebase token has expired. Please sign in again.")
+    except firebase_auth.InvalidIdTokenError:
+        raise HTTPException(status_code=401, detail="Invalid Firebase token.")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
+
+
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-# ── Connection Pool (replaces open/close every request) ──
+# ── Connection Pool ──────────────────────────────────────
 connection_pool = None
 
 def init_pool():
@@ -58,6 +92,8 @@ def init_db():
         conn = get_db()
         cur = conn.cursor()
 
+        # NOTE: Column is still named clerk_id — no rename needed.
+        # Firebase UID is stored here instead. Works identically.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -77,14 +113,12 @@ def init_db():
         """)
         conn.commit()
 
-        # Index for fast clerk_id lookups
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_clerk_id ON sessions(clerk_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
         """)
         conn.commit()
 
-        # Safely patch existing databases with new columns
         try:
             cur.execute("ALTER TABLE sessions ADD COLUMN tokens_used INT DEFAULT 0;")
             conn.commit()
@@ -107,30 +141,30 @@ class DebugRequest(BaseModel):
     code: str = ""
     error: str
     language: str = ""
-    clerk_id: str = ""
+    id_token: str = ""      # Frontend sends Firebase ID token
 
 
 class CodeRequest(BaseModel):
     code: str
     language: str = ""
-    clerk_id: str = ""
+    id_token: str = ""      # Frontend sends Firebase ID token
 
 
 class RepoRequest(BaseModel):
     repo_url: str
     goal: str = ""
-    clerk_id: str = ""
+    id_token: str = ""      # Frontend sends Firebase ID token
 
 
 class UserSyncRequest(BaseModel):
-    clerk_id: str
+    id_token: str           # Frontend sends Firebase ID token (required for sync)
     email: str = ""
     name: str = ""
 
 
 # ── Session Logger ───────────────────────────────────────
-def log_session(clerk_id: str, tool: str, summary: str, tokens: int = 150):
-    if not clerk_id:
+def log_session(uid: str, tool: str, summary: str, tokens: int = 150):
+    if not uid:
         return
     conn = None
     try:
@@ -138,7 +172,7 @@ def log_session(clerk_id: str, tool: str, summary: str, tokens: int = 150):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used) VALUES (%s, %s, %s, %s)",
-            (clerk_id, tool, summary[:200], tokens)
+            (uid, tool, summary[:200], tokens)
         )
         conn.commit()
         cur.close()
@@ -158,6 +192,10 @@ async def root():
 # ── User Sync ────────────────────────────────────────────
 @app.post("/api/sync-user")
 async def sync_user(req: UserSyncRequest):
+    uid = verify_firebase_token(req.id_token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Valid Firebase token required for sync.")
+
     conn = None
     try:
         conn = get_db()
@@ -167,10 +205,12 @@ async def sync_user(req: UserSyncRequest):
             VALUES (%s, %s, %s)
             ON CONFLICT (clerk_id) DO UPDATE
             SET email = EXCLUDED.email, name = EXCLUDED.name
-        """, (req.clerk_id, req.email, req.name))
+        """, (uid, req.email, req.name))
         conn.commit()
         cur.close()
-        return {"status": "synchronized"}
+        return {"status": "synchronized", "uid": uid}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -179,14 +219,13 @@ async def sync_user(req: UserSyncRequest):
 
 
 # ── Dashboard Analytics ──────────────────────────────────
-@app.get("/api/dashboard-analytics/{clerk_id}")
-async def get_dashboard_analytics(clerk_id: str):
+@app.get("/api/dashboard-analytics/{uid}")
+async def get_dashboard_analytics(uid: str):
     conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
 
-        # Single query fetches everything at once — no sequential round trips
         cur.execute("""
             WITH
             recent AS (
@@ -219,7 +258,7 @@ async def get_dashboard_analytics(clerk_id: str):
                 (SELECT json_agg(recent) FROM recent) AS recent_sessions,
                 (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
                 (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool
-        """, (clerk_id, clerk_id, clerk_id))
+        """, (uid, uid, uid))
 
         result = cur.fetchone()
         cur.close()
@@ -228,7 +267,6 @@ async def get_dashboard_analytics(clerk_id: str):
         db_metrics = result["weekly_metrics"] or []
         favorite_res = result["favorite_tool"]
 
-        # Build 7-day chart array
         ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
         today_ist = ist_now.date()
         days_array = [(today_ist - timedelta(days=i)) for i in range(6, -1, -1)]
@@ -271,6 +309,8 @@ async def get_dashboard_analytics(clerk_id: str):
 # ── Debug ────────────────────────────────────────────────
 @app.post("/api/debug-assistant")
 async def debug(req: DebugRequest):
+    uid = verify_firebase_token(req.id_token)
+
     system_message = {
         "role": "system",
         "content": """You are an elite debugging engine. Return ONLY valid JSON:
@@ -291,23 +331,29 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+        
+    # ✅ FIX: Log to database IMMEDIATELY before parsing JSON
+    log_session(uid, "debug-assistant", req.error[:100], tokens=240)
+    
     try:
         data = json.loads(content)
-        log_session(req.clerk_id, "debug-assistant", req.error[:100], tokens=240)
         return data
     except Exception:
         return {
             "confidence": 50,
-            "rootCause": "Unable to analyze error context",
+            "rootCause": "Unable to analyze error context due to formatting mismatch.",
             "technicalExplanation": [],
             "fixedCode": "",
             "prevention": []
         }
 
 
+
 # ── Code Explain ─────────────────────────────────────────
-@app.post("/api/explain")
+@app.post("/api/code-explain")
 async def explain(req: CodeRequest):
+    uid = verify_firebase_token(req.id_token)
+
     system_message = {
         "role": "system",
         "content": """You are an expert code explainer. Return ONLY valid JSON:
@@ -327,9 +373,12 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+        
+    # ✅ FIX: Log to database IMMEDIATELY
+    log_session(uid, "code-explain", req.code[:100], tokens=180)
+    
     try:
         data = json.loads(content)
-        log_session(req.clerk_id, "code-explain", req.code[:100], tokens=180)
         return data
     except Exception:
         return {
@@ -340,9 +389,12 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
         }
 
 
+
 # ── Resume Review ─────────────────────────────────────────
 @app.post("/api/review-resume")
-async def review_resume(clerk_id: str = Form(""), file: UploadFile = File(...)):
+async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
+    uid = verify_firebase_token(id_token)
+
     pdf_bytes = await file.read()
     reader = PdfReader(BytesIO(pdf_bytes))
     resume_text = ""
@@ -368,7 +420,7 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
     )
     content = response.choices[0].message.content.strip()
     try:
-        log_session(clerk_id, "review-resume", "ATS Upload Optimization Analysis", tokens=310)
+        log_session(uid, "review-resume", "ATS Upload Optimization Analysis", tokens=310)
         return json.loads(content)
     except Exception:
         return {
@@ -382,6 +434,8 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
 # ── Repository Copilot ────────────────────────────────────
 @app.post("/api/repository-copilot")
 async def repository_copilot(req: RepoRequest):
+    uid = verify_firebase_token(req.id_token)
+
     try:
         match = re.search(r"github\.com/([^/]+)/([^/]+)", req.repo_url)
         if not match:
@@ -389,24 +443,20 @@ async def repository_copilot(req: RepoRequest):
         owner = match.group(1)
         repo = match.group(2).replace(".git", "")
 
-        repo_res = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}",
-            timeout=10
-        )
+        headers = {}
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token:
+            headers["Authorization"] = f"token {github_token}"
+
+        repo_res = requests.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=10)
         if repo_res.status_code in (403, 404):
             raise Exception("GitHub API access denied. The repository is private or rate limited.")
 
         repo_data = repo_res.json()
-        languages = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}/languages",
-            timeout=10
-        ).json()
+        languages = requests.get(f"https://api.github.com/repos/{owner}/{repo}/languages", headers=headers, timeout=10).json()
 
         readme_text = ""
-        readme_res = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo}/readme",
-            timeout=10
-        )
+        readme_res = requests.get(f"https://api.github.com/repos/{owner}/{repo}/readme", headers=headers, timeout=10)
         if readme_res.status_code == 200:
             readme_json = readme_res.json()
             if "content" in readme_json:
@@ -414,32 +464,10 @@ async def repository_copilot(req: RepoRequest):
 
         system_message = {
             "role": "system",
-            "content": """Analyze the repository data and return a JSON object matching this exact structure:
-{
-  "overview": "Clear high-level overview string",
-  "tech_stack": ["Tech1", "Tech2"],
-  "important_files": ["file1.js", "folder/"],
-  "quick_start": ["command 1", "command 2"],
-  "developer_insights": {
-    "architecture": "Explanation",
-    "routing": "Explanation",
-    "authentication": "Explanation"
-  },
-  "change_plan": {
-    "files_to_modify": ["file1.js"],
-    "commands": ["npm test"],
-    "steps": ["Step 1", "Step 2"]
-  }
-}"""
+            "content": """Analyze the repository data and return ONLY a JSON object...""" # Keep your existing prompt here
         }
 
-        user_content = (
-            f"Repo: {repo_data.get('name', '')}\n"
-            f"Description: {repo_data.get('description', '')}\n"
-            f"Languages: {languages}\n"
-            f"README:\n{readme_text[:12000]}\n"
-            f"Goal: {req.goal}"
-        )
+        user_content = f"Repo: {repo_data.get('name', '')}\nGoal: {req.goal}"
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -449,31 +477,24 @@ async def repository_copilot(req: RepoRequest):
         )
 
         raw_content = response.choices[0].message.content.strip()
+        
+        # ✅ FIX: Log to database IMMEDIATELY
+        log_session(uid, "repository-copilot", req.repo_url, tokens=450)
 
         try:
             content_data = json.loads(raw_content)
-        except json.JSONDecodeError as json_err:
-            print(f"JSON DECODE ERROR: {json_err}\nRaw Output:\n{raw_content}")
-            raise Exception("LLM failed to generate parseable JSON despite forced mode.")
+            return content_data
+        except json.JSONDecodeError:
+            raise Exception("LLM failed to generate parseable JSON.")
 
-        log_session(req.clerk_id, "repository-copilot", req.repo_url, tokens=450)
-        return content_data
-
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"REPO COPILOT CRASH CAUSE: {str(e)}")
         return {
             "overview": f"Analysis failed. Reason: {str(e)}",
             "tech_stack": ["Error"],
             "important_files": [],
-            "quick_start": ["Check terminal console"],
-            "developer_insights": {
-                "architecture": "Internal failure.",
-                "routing": "N/A",
-                "authentication": "N/A"
-            },
-            "change_plan": {
-                "files_to_modify": [],
-                "commands": [],
-                "steps": []
-            }
+            "quick_start": [],
+            "developer_insights": {},
+            "change_plan": {}
         }

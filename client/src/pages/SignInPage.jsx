@@ -1,6 +1,7 @@
 import React, { useState } from "react";
-import { useSignIn } from "@clerk/clerk-react";
 import { useNavigate, useLocation, Link } from "react-router-dom";
+import { signInWithPopup, signInWithEmailAndPassword } from "firebase/auth";
+import { auth, googleProvider, githubProvider } from "../firebase";
 import NavLogo from "../components/NavLogo";
 
 const BG = "#252523";
@@ -86,7 +87,6 @@ const labelStyle = {
 };
 
 const SignInPage = () => {
-  const { isLoaded, signIn, setActive } = useSignIn();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -99,41 +99,28 @@ const SignInPage = () => {
 
   const handleSignIn = async (e) => {
     e.preventDefault();
-    if (!isLoaded) return;
     setError("");
     setLoading(true);
     try {
-      const result = await signIn.create({ identifier: email, password });
-      if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
-        navigate(from, { replace: true });
-      } else {
-        setError("Sign-in incomplete. Please try again.");
-      }
+      await signInWithEmailAndPassword(auth, email, password);
+      navigate(from, { replace: true });
     } catch (err) {
-      setError(
-        err?.errors?.[0]?.longMessage ||
-          "Invalid credentials. Please try again.",
-      );
+      setError(err.message || "Invalid credentials. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
-  // Clerk handles the entire Google/GitHub OAuth flow on its backend.
-  // You don't need custom OAuth credentials — Clerk's shared keys do it all.
   const handleOAuth = async (provider) => {
-    if (!isLoaded) return;
+    const p = provider === "google" ? googleProvider : githubProvider;
     setOauthLoading(provider);
     setError("");
     try {
-      await signIn.authenticateWithRedirect({
-        strategy: `oauth_${provider}`,
-        redirectUrl: `https://stack-pilot-agentic.vercel.app/sso-callback`,
-        redirectUrlComplete: `https://stack-pilot-agentic.vercel.app/ai`,
-      });
+      await signInWithPopup(auth, p);
+      navigate(from, { replace: true });
     } catch (err) {
-      setError(`Could not sign in with ${provider}. Please try again.`);
+      setError(err.message); // ← change this line temporarily
+    } finally {
       setOauthLoading("");
     }
   };
@@ -191,7 +178,6 @@ const SignInPage = () => {
           maxWidth: 420,
         }}
       >
-        {/* Logo */}
         <div style={{ textAlign: "center", marginBottom: 32 }}>
           <div
             style={{
@@ -213,7 +199,6 @@ const SignInPage = () => {
           </p>
         </div>
 
-        {/* OAuth Buttons */}
         <div
           style={{
             display: "flex",
@@ -240,10 +225,9 @@ const SignInPage = () => {
           >
             {oauthLoading === "github" ? <Spinner /> : <GitHubIcon />}
             {oauthLoading === "github"
-              ? "Redirecting..."
+              ? "Signing in..."
               : "Continue with GitHub"}
           </button>
-
           <button
             onClick={() => handleOAuth("google")}
             disabled={!!oauthLoading}
@@ -262,12 +246,11 @@ const SignInPage = () => {
           >
             {oauthLoading === "google" ? <Spinner /> : <GoogleIcon />}
             {oauthLoading === "google"
-              ? "Redirecting..."
+              ? "Signing in..."
               : "Continue with Google"}
           </button>
         </div>
 
-        {/* Divider */}
         <div
           style={{
             display: "flex",
@@ -283,7 +266,6 @@ const SignInPage = () => {
           <div style={{ flex: 1, height: 1, background: BORDER }} />
         </div>
 
-        {/* Email + Password Form */}
         <form
           onSubmit={handleSignIn}
           style={{ display: "flex", flexDirection: "column", gap: 14 }}
@@ -301,7 +283,6 @@ const SignInPage = () => {
               onBlur={(e) => (e.target.style.borderColor = BORDER)}
             />
           </div>
-
           <div>
             <div
               style={{
@@ -312,20 +293,6 @@ const SignInPage = () => {
               }}
             >
               <label style={{ ...labelStyle, marginBottom: 0 }}>Password</label>
-              <Link
-                to="/forgot-password"
-                style={{
-                  color: INK2,
-                  fontSize: 11,
-                  textDecoration: "none",
-                  fontFamily: "'Syne', sans-serif",
-                  transition: "color 0.15s",
-                }}
-                onMouseEnter={(e) => (e.target.style.color = ACCENT)}
-                onMouseLeave={(e) => (e.target.style.color = INK2)}
-              >
-                Forgot password?
-              </Link>
             </div>
             <div style={{ position: "relative" }}>
               <input
@@ -363,8 +330,8 @@ const SignInPage = () => {
           {error && (
             <div
               style={{
-                background: "rgba(232,87,42,0.08)",
-                border: `1px solid rgba(232,87,42,0.25)`,
+                background: "rgba(42,99,232,0.08)",
+                border: `1px solid rgba(42,99,232,0.25)`,
                 borderRadius: 8,
                 padding: "10px 14px",
                 color: ACCENT,
@@ -380,7 +347,7 @@ const SignInPage = () => {
 
           <button
             type="submit"
-            disabled={loading || !isLoaded}
+            disabled={loading}
             style={{
               marginTop: 4,
               background: loading ? "#2a2a28" : ACCENT,

@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from "react";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
-
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
 const RepositoryCopilot = () => {
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const navigate = useNavigate();
 
   const [url, setUrl] = useState("");
@@ -27,19 +27,9 @@ const RepositoryCopilot = () => {
 
   useEffect(() => {
     document.title = "StackPilot - Repository Copilot";
-    if (!user) return;
-    fetch(
-      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
-    )
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.time_series_7d) {
-          const todayData = data.time_series_7d[data.time_series_7d.length - 1];
-          const todayRepoRuns = todayData["repository-copilot"] || 0;
-        }
-      })
-      .catch((err) => console.error("Failed to sync tool telemetry:", err));
-  }, [user]);
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
 
   const handleAnalyze = async (e) => {
     e?.preventDefault();
@@ -50,6 +40,9 @@ const RepositoryCopilot = () => {
     setResult(null);
 
     try {
+      const idToken = auth.currentUser 
+  ? await auth.currentUser.getIdToken() 
+  : "";
       const response = await fetch(
         "https://stackpilot-oom6.onrender.com/api/repository-copilot",
         {
@@ -58,7 +51,7 @@ const RepositoryCopilot = () => {
           body: JSON.stringify({
             repo_url: url,
             goal: goal,
-            clerk_id: user?.id || "",
+            id_token: idToken,
           }),
         },
       );

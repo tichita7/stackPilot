@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from "react";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
-
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
 const DebugAssistant = () => {
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
   const navigate = useNavigate();
 
   const [code, setCode] = useState("");
@@ -24,24 +24,14 @@ const DebugAssistant = () => {
   const INK2 = "#c4ccc9";
   const BORDER = "#2a2a28";
   const TECH_BLUE = "#00d2ff";
-  const CRISIS_RED = "#c33620"; // Tool brand color for tracking bugs
+  const CRISIS_RED = "#c33620";
   const SUCCESS_GREEN = "#4ade80";
 
   useEffect(() => {
     document.title = "StackPilot - Debug Assistant";
-    if (!user) return;
-    fetch(
-      `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.id}`,
-    )
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.time_series_7d) {
-          const todayData = data.time_series_7d[data.time_series_7d.length - 1];
-          const todayDebugRuns = todayData["debug-assistant"] || 0;
-        }
-      })
-      .catch((err) => console.error("Failed to sync tool telemetry:", err));
-  }, [user]);
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
 
   const handleAnalyze = async (e) => {
     e?.preventDefault();
@@ -52,6 +42,9 @@ const DebugAssistant = () => {
     setResult(null);
 
     try {
+      const idToken = auth.currentUser 
+  ? await auth.currentUser.getIdToken() 
+  : "";
       const response = await fetch(
         "https://stackpilot-oom6.onrender.com/api/debug-assistant",
         {
@@ -61,7 +54,7 @@ const DebugAssistant = () => {
             code: code,
             error: errorLog,
             language: language || "Auto-detect",
-            clerk_id: user?.id || "",
+            id_token: idToken,
           }),
         },
       );
@@ -205,7 +198,6 @@ const DebugAssistant = () => {
             onSubmit={handleAnalyze}
             style={{ display: "flex", flexDirection: "column", gap: 16 }}
           >
-            {/* Top Config Row */}
             <div style={{ display: "flex", gap: 16 }}>
               <div style={{ flex: 1 }}>
                 <input
@@ -258,7 +250,6 @@ const DebugAssistant = () => {
               </div>
             </div>
 
-            {/* Code Context Area */}
             <div style={{ position: "relative" }}>
               <textarea
                 placeholder="// Paste the underlying script code context here..."
@@ -335,7 +326,6 @@ const DebugAssistant = () => {
           )}
         </div>
 
-        {/* Output Results Window */}
         {result && (
           <div
             style={{
@@ -382,7 +372,6 @@ const DebugAssistant = () => {
             </div>
 
             <div style={{ padding: 32 }}>
-              {/* 1. Root Cause Analysis */}
               {activeTab === "overview" && (
                 <div>
                   <div
@@ -418,7 +407,6 @@ const DebugAssistant = () => {
                 </div>
               )}
 
-              {/* 2. Technical Breakdown Points */}
               {activeTab === "explanation" && (
                 <div>
                   <h3
@@ -453,7 +441,6 @@ const DebugAssistant = () => {
                 </div>
               )}
 
-              {/* 3. Patch Fixed Code Box */}
               {activeTab === "fixed_code" && (
                 <div>
                   <h3
@@ -495,7 +482,6 @@ const DebugAssistant = () => {
                 </div>
               )}
 
-              {/* 4. Prevention Steps */}
               {activeTab === "prevention" && (
                 <div>
                   <h3
