@@ -17,11 +17,13 @@ createRoot(document.getElementById("root")).render(
       publishableKey={PUBLISHABLE_KEY}
       signInUrl="/sign-in"
       signUpUrl="/sign-up"
+      afterSignInUrl="/ai"
+      afterSignUpUrl="/ai"
       afterSignOutUrl="/"
     >
       <BrowserRouter>
         <App />
       </BrowserRouter>
     </ClerkProvider>
-  </StrictMode>
+  </StrictMode>,
 );

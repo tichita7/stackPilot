@@ -1,9 +1,9 @@
 import React from "react";
-import { useUser } from "@clerk/clerk-react";
+import { useUser, AuthenticateWithRedirectCallback } from "@clerk/clerk-react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { AuthenticateWithRedirectCallback } from "@clerk/clerk-react";
 
 import SignInPage from "./pages/SignInPage";
+import SignUpPage from "./pages/SignUpPage";
 import Home from "./pages/Home";
 import Dashboard from "./pages/Dashboard";
 import DebugAssistant from "./pages/DebugAssistant";
@@ -14,13 +14,10 @@ import RepositoryCopilot from "./pages/RepositoryCopilot";
 const ProtectedRoute = ({ children }) => {
   const { isSignedIn, isLoaded } = useUser();
   const location = useLocation();
-
   if (!isLoaded) return null;
-
   if (!isSignedIn) {
     return <Navigate to="/sign-in" state={{ from: location }} replace />;
   }
-
   return children;
 };
 
@@ -30,6 +27,7 @@ const App = () => {
       {/* PUBLIC */}
       <Route path="/" element={<Home />} />
       <Route path="/sign-in" element={<SignInPage />} />
+      <Route path="/sign-up" element={<SignUpPage />} />
       <Route
         path="/sso-callback"
         element={<AuthenticateWithRedirectCallback />}
