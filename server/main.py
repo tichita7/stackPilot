@@ -32,6 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ── Firebase Admin Init ──────────────────────────────────
 # Reads the full service account JSON from environment variable
 _raw_key = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
@@ -70,6 +71,7 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # ── Connection Pool ──────────────────────────────────────
 connection_pool = None
 
+
 def init_pool():
     global connection_pool
     connection_pool = pool.ThreadedConnectionPool(
@@ -79,8 +81,10 @@ def init_pool():
         cursor_factory=RealDictCursor
     )
 
+
 def get_db():
     return connection_pool.getconn()
+
 
 def release_db(conn):
     connection_pool.putconn(conn)
@@ -331,10 +335,10 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```\w*", "", content).replace("```", "").strip()
-        
+
     # ✅ FIX: Log to database IMMEDIATELY before parsing JSON
     log_session(uid, "debug-assistant", req.error[:100], tokens=240)
-    
+
     try:
         data = json.loads(content)
         return data
@@ -346,7 +350,6 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
             "fixedCode": "",
             "prevention": []
         }
-
 
 
 # ── Code Explain ─────────────────────────────────────────
@@ -373,10 +376,10 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```\w*", "", content).replace("```", "").strip()
-        
+
     # ✅ FIX: Log to database IMMEDIATELY
     log_session(uid, "code-explain", req.code[:100], tokens=180)
-    
+
     try:
         data = json.loads(content)
         return data
@@ -387,7 +390,6 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
             "complexity": {"time": "-", "space": "-"},
             "improvements": []
         }
-
 
 
 # ── Resume Review ─────────────────────────────────────────
@@ -448,15 +450,27 @@ async def repository_copilot(req: RepoRequest):
         if github_token:
             headers["Authorization"] = f"token {github_token}"
 
-        repo_res = requests.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=10)
+        repo_res = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            headers=headers,
+            timeout=10
+        )
         if repo_res.status_code in (403, 404):
             raise Exception("GitHub API access denied. The repository is private or rate limited.")
 
         repo_data = repo_res.json()
-        languages = requests.get(f"https://api.github.com/repos/{owner}/{repo}/languages", headers=headers, timeout=10).json()
+        languages = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/languages",
+            headers=headers,
+            timeout=10
+        ).json()
 
         readme_text = ""
-        readme_res = requests.get(f"https://api.github.com/repos/{owner}/{repo}/readme", headers=headers, timeout=10)
+        readme_res = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/readme",
+            headers=headers,
+            timeout=10
+        )
         if readme_res.status_code == 200:
             readme_json = readme_res.json()
             if "content" in readme_json:
@@ -464,7 +478,23 @@ async def repository_copilot(req: RepoRequest):
 
         system_message = {
             "role": "system",
-            "content": """Analyze the repository data and return ONLY a JSON object...""" # Keep your existing prompt here
+            "content": """You are an expert repository analyst. Given repository metadata (name, languages, README content, and the user's goal), return ONLY a valid JSON object with this exact structure:
+{
+  "overview": "A 3-5 sentence summary of the project's purpose and architecture",
+  "tech_stack": ["List", "of", "technologies", "used"],
+  "important_files": ["path/to/file1", "path/to/file2"],
+  "quick_start": ["git clone ...", "npm install", "npm run dev"],
+  "developer_insights": {
+    "architecture": "...",
+    "routing": "...",
+    "state_management": "..."
+  },
+  "change_plan": {
+    "files_to_modify": ["file1", "file2"],
+    "steps": ["Step 1...", "Step 2..."]
+  }
+}
+Focus the analysis on the user's stated goal if provided. Return ONLY the JSON object, no markdown, no explanation."""
         }
 
         user_content = f"Repo: {repo_data.get('name', '')}\nGoal: {req.goal}"
@@ -477,7 +507,7 @@ async def repository_copilot(req: RepoRequest):
         )
 
         raw_content = response.choices[0].message.content.strip()
-        
+
         # ✅ FIX: Log to database IMMEDIATELY
         log_session(uid, "repository-copilot", req.repo_url, tokens=450)
 
