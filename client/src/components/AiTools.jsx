@@ -1,11 +1,17 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
 import { AiToolsData } from "../assets/assets";
 import { useNavigate } from "react-router-dom";
-import { useUser } from "@clerk/clerk-react";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../firebase";
 
 const AiTools = () => {
   const navigate = useNavigate();
-  const { user } = useUser();
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
 
   return (
     <div className="px-4 sm:px-20 xl:px-32 my-24">
@@ -26,7 +32,7 @@ const AiTools = () => {
             className="p-8 m-4 max-w-xs rounded-lg bg-[#FDFDFE]
           shadow-lg border border-gray-100 hover:-translate-y-1 transition-all
           duration-300 cursor-pointer"
-            onClick={() => user && navigate(tool.path)}
+            onClick={() => (user ? navigate(tool.path) : navigate("/sign-up"))}
           >
             <tool.Icon
               className="w-12 h-12 p-3 text-white rounded-xl"
