@@ -329,7 +329,7 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
     }
     user_content = f"Language: {req.language}\nError:\n{req.error}\nCode:\n{req.code}"
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-20b",
         messages=[system_message, {"role": "user", "content": user_content}]
     )
     content = response.choices[0].message.content.strip()
@@ -370,7 +370,7 @@ Rules: Return ONLY JSON. No markdown. No code fences."""
     }
     user_content = f"Language: {req.language}\nCode:\n{req.code}"
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-20b",
         messages=[system_message, {"role": "user", "content": user_content}]
     )
     content = response.choices[0].message.content.strip()
@@ -417,7 +417,7 @@ async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
 Rules: Return ONLY JSON. No markdown. Score 0-100."""
     }
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-20b",
         messages=[system_message, {"role": "user", "content": resume_text}]
     )
     content = response.choices[0].message.content.strip()
@@ -500,7 +500,7 @@ Focus the analysis on the user's stated goal if provided. Return ONLY the JSON o
         user_content = f"Repo: {repo_data.get('name', '')}\nGoal: {req.goal}"
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[system_message, {"role": "user", "content": user_content}],
             temperature=0.1,
             response_format={"type": "json_object"}
