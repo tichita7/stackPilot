@@ -502,6 +502,10 @@ For change_plan:
 - If the user's goal is to UNDERSTAND, TRACE, ANALYZE, or EXPLAIN existing code, files_to_modify should contain the relevant files that need to be inspected, and steps should describe the investigation/tracing process. In this case, "files_to_modify" means "relevant files to inspect", not necessarily files that must be changed.
 - Never leave files_to_modify or steps empty when relevant files can be identified from the repository.
 - Steps must be specific to the user's goal and repository, not generic instructions.
+- The "steps" field MUST be an array of separate step strings.
+- Each step must contain exactly one actionable investigation or implementation step.
+- Do not combine multiple numbered steps into a single string.
+- Do not include step numbers such as "1.", "2.", etc. inside the strings; numbering will be handled by the frontend.
 
 Return ONLY the JSON object, no markdown, no explanation."""
         }
