@@ -494,7 +494,16 @@ async def repository_copilot(req: RepoRequest):
     "steps": ["Step 1...", "Step 2..."]
   }
 }
-Focus the analysis on the user's stated goal if provided. Return ONLY the JSON object, no markdown, no explanation."""
+Focus the analysis on the user's stated goal if provided.
+
+For change_plan:
+- Always provide a meaningful change_plan when a user goal is provided.
+- If the user's goal is to MODIFY or FIX the repository, files_to_modify should contain the concrete files that would likely need changes, and steps should describe the implementation steps.
+- If the user's goal is to UNDERSTAND, TRACE, ANALYZE, or EXPLAIN existing code, files_to_modify should contain the relevant files that need to be inspected, and steps should describe the investigation/tracing process. In this case, "files_to_modify" means "relevant files to inspect", not necessarily files that must be changed.
+- Never leave files_to_modify or steps empty when relevant files can be identified from the repository.
+- Steps must be specific to the user's goal and repository, not generic instructions.
+
+Return ONLY the JSON object, no markdown, no explanation."""
         }
 
         user_content = f"Repo: {repo_data.get('name', '')}\nGoal: {req.goal}"
