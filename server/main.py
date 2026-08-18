@@ -358,16 +358,38 @@ async def explain(req: CodeRequest):
     uid = verify_firebase_token(req.id_token)
 
     system_message = {
-        "role": "system",
-        "content": """You are an expert code explainer. Return ONLY valid JSON:
+    "role": "system",
+    "content": """You are an expert code analyzer and code explainer.
+
+First, analyze the provided code for correctness before explaining it.
+
+Return ONLY valid JSON with exactly this structure:
 {
-  "summary": "Short explanation",
+  "summary": "Short explanation of what the code does or, if invalid, what it appears intended to do",
   "breakdown": ["Step 1", "Step 2"],
-  "complexity": {"time": "O(n)", "space": "O(1)"},
+  "complexity": {
+    "time": "O(n)",
+    "space": "O(1)"
+  },
   "improvements": ["Tip 1", "Tip 2"]
 }
-Rules: Return ONLY JSON. No markdown. No code fences."""
-    }
+
+Rules:
+- Return ONLY JSON. No markdown. No code fences.
+- First determine whether the code appears syntactically valid and complete.
+- If there is a syntax or compilation error, clearly mention it in the summary.
+- Identify obvious syntax errors, missing imports/includes, undefined variables or functions, and incomplete code.
+- Identify potential runtime errors such as null/undefined access, out-of-bounds access, division by zero, or unhandled exceptions when they are visible from the code.
+- Identify logical or behavioral issues when they can be determined from the code.
+- If the code is invalid, do NOT pretend that it successfully runs.
+- If the code is incomplete, clearly state that the analysis is based only on the provided portion.
+- Distinguish between definite errors visible in the code and potential runtime issues.
+- Do NOT claim that you compiled or executed the code unless an actual execution environment was used.
+- The breakdown should explain the code in logical steps. If the code is invalid, include the relevant error in the breakdown.
+- Provide accurate time and space complexity when it can be determined. If it cannot be determined because the code is incomplete or invalid, say so instead of guessing.
+- Improvements should contain useful corrections or suggestions relevant to the provided code.
+"""
+}
     user_content = f"Language: {req.language}\nCode:\n{req.code}"
     response = client.chat.completions.create(
         model="openai/gpt-oss-20b",

@@ -1,6 +1,8 @@
 # 🚀 StackPilot
 
-StackPilot is an agentic AI-powered developer platform that helps developers debug code, understand repositories, explain code snippets, and optimize resumes using intelligent AI workflows.
+StackPilot is an AI-powered developer platform that brings multiple developer workflows into one place.
+
+It helps developers debug code, understand and analyze repositories, explain code snippets, and improve resumes through specialized AI-powered workflows.
 
 ---
 
@@ -8,51 +10,89 @@ StackPilot is an agentic AI-powered developer platform that helps developers deb
 
 ### 🐞 Debug Assistant
 
-Analyze code and receive:
+Analyze code and error logs to identify problems and receive actionable debugging assistance.
+
+Capabilities include:
 
 - Root cause analysis
-- Error explanations
+- Error explanation
 - Suggested fixes
 - Corrected code snippets
-- Debugging best practices
+- Debugging recommendations
+- Potential runtime issues
+- Logical issue detection
 
 ---
 
 ### 📂 Repository Copilot
 
-Connect a GitHub repository and ask questions about your codebase.
+Connect a GitHub repository and analyze the codebase using a natural-language goal.
 
-Capabilities:
+Repository Copilot can help developers understand unfamiliar codebases by providing:
 
-- Repository architecture overview
-- Folder structure analysis
+- Project architecture overview
+- Technology stack identification
+- Important file identification
+- Folder and file structure analysis
 - Route mapping
 - Component relationships
+- Authentication flow analysis
+- Database/schema insights
 - Dependency understanding
-- Future plan recommendations
+- Repository-specific developer insights
+- Relevant files to inspect
+- Step-by-step investigation plans
+- Step-by-step implementation plans
+
+The analysis adapts to the user's goal.
+
+For example, users can ask:
+
+> Find the Code Explainer implementation and explain how a user's code travels from the React frontend to the FastAPI backend and finally to the AI service.
+
+Repository Copilot can then identify the relevant files and map the data flow across the application.
 
 ---
 
 ### 💡 Code Explain
 
-Paste code snippets and get:
+Paste a code snippet and receive an AI-powered explanation of the code.
 
-- Step-by-step explanations
+Capabilities include:
+
+- Step-by-step explanation
 - Logic breakdown
 - Time complexity analysis
 - Space complexity analysis
 - Optimization suggestions
+- Syntax and compilation issue detection
+- Potential runtime issue detection
+- Logical/behavioral issue detection
+- Missing import/include detection
+- Undefined variable or function detection
+- Suggestions for correcting problematic code
+
+Code Explain first analyzes whether the provided code appears valid and complete before explaining its behavior.
+
+If the code contains an obvious issue, StackPilot identifies the problem instead of pretending that the code is valid.
+
+> **Note:** Code analysis is AI-based. StackPilot does not claim to compile or execute code unless an actual execution environment is used.
 
 ---
 
 ### 📄 Resume Reviewer
 
-Upload your resume and receive:
+Upload a resume and receive AI-powered feedback designed to improve its effectiveness for software engineering applications.
+
+Capabilities include:
 
 - ATS compatibility feedback
 - Resume scoring
 - Skill-gap analysis
 - Content improvement recommendations
+- Technical keyword suggestions
+- Role-specific optimization
+- Bullet-point improvement suggestions
 
 ---
 
@@ -62,153 +102,61 @@ Upload your resume and receive:
 
 - React 19
 - Vite
-- Tailwind CSS 4
+- Tailwind CSS
 - React Router
-- Clerk Authentication
+- Firebase Authentication
 - Lucide Icons
 
 ### Backend
 
 - Python
+- FastAPI
 - Groq API
-- Llama 3.3 70B
 
 ### AI
 
-- Meta Llama 3.3 70B
+- GPT OSS 20B through Groq
 - Prompt Engineering
-- Agentic AI Workflows
+- Structured AI responses
+- Agentic AI workflows
+- Repository-aware analysis
+
+### Deployment & Infrastructure
+
+- Vercel — Frontend deployment
+- Render — Backend deployment
+- GitHub — Source control and repository integration
+- Firebase — Authentication
 
 ---
 
-## 📁 Project Structure
+## 🧠 AI Architecture
 
-stackPilot/
-
-├── client/
-
-│ ├── src/
-
-│ ├── public/
-
-│ ├── package.json
-
-│ └── ...
-
-├── server/
-
-│ ├── main.py
-
-│ ├── routes/
-
-│ └── ...
-
-└── README.md
-
----
-
-## ⚙️ Installation
-
-### Clone Repository
-
-```bash
-git clone https://github.com/tichita7/stackPilot.git
-cd stackPilot
-```
-
-### Install Frontend Dependencies
-
-```bash
-cd client
-npm install
-```
-
-### Create Environment Variables
-
-Create a `.env` file.
-
-Frontend:
-
-```env
-VITE_CLERK_PUBLISHABLE_KEY=your_key
-```
-
-Backend:
-
-```env
-GROQ_API_KEY=your_groq_api_key
-```
-
----
-
-## 🚀 Running the Project
-
-### Start Frontend
-
-```bash
-cd client
-npm run dev
-```
-
-Frontend will run on:
+StackPilot uses specialized AI workflows for different developer tasks instead of treating every request as a generic chatbot interaction.
 
 ```text
-http://localhost:5173
+                         ┌───────────────────┐
+                         │     StackPilot    │
+                         └─────────┬─────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+              ▼                    ▼                    ▼
+       Debug Assistant     Repository Copilot     Code Explain
+              │                    │                    │
+              │                    │                    │
+              └────────────────────┼────────────────────┘
+                                   │
+                                   ▼
+                            AI Processing
+                                   │
+                                   ▼
+                             Groq / GPT OSS
+                                   │
+                                   ▼
+                          Structured Response
+
+                                   │
+                                   ▼
+                           Resume Reviewer
 ```
-
-### Start Backend
-
-```bash
-cd server
-
-uvicorn main:app --reload
-```
-
----
-
-## 🤖 AI Model
-
-StackPilot uses:
-
-- Llama 3.3 70B
-- Groq Inference Engine
-
-for:
-
-- Repository Analysis
-- Debugging Assistance
-- Code Explanation
-- Resume Review
-
----
-
-## 🎯 Why StackPilot?
-
-Developers frequently switch between multiple tools for:
-
-- Debugging
-- Repository Analysis
-- Code Understanding
-- Resume Optimization
-
-StackPilot brings these workflows together into a single AI-powered platform.
-
----
-
-<!-- ## 🔮 Future Roadmap
-
-- Repository visualizer
-- Pull request review assistant
-- AI-generated documentation
-- Architecture diagrams
-- Test case generation
-- Team collaboration features
-- Multi-agent workflows
-
---- -->
-
-## 👩‍💻 Author
-
-Tichita Dhiman
-
----
