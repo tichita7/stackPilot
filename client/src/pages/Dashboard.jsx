@@ -131,6 +131,8 @@ const Dashboard = () => {
       favorite_assistant: "None (0 runs)",
       workspace_momentum: "+0% growth vs last cycle",
       streak_count: "0 Days Active",
+      avg_latency: "—",
+      optimization_yield: "—",
     },
   };
 
@@ -415,7 +417,7 @@ const Dashboard = () => {
                       marginTop: 2,
                     }}
                   >
-                    840ms
+                    {data.metrics.avg_latency || "—"}
                   </div>
                 </div>
                 <div>
@@ -427,7 +429,7 @@ const Dashboard = () => {
                       textTransform: "uppercase",
                     }}
                   >
-                    Optimization Yield
+                    Tool Success Rate
                   </div>
                   <div
                     style={{
@@ -437,7 +439,7 @@ const Dashboard = () => {
                       marginTop: 2,
                     }}
                   >
-                    94.6%
+                    {data.metrics.optimization_yield || "—"}
                   </div>
                 </div>
               </div>

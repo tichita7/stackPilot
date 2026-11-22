@@ -5,6 +5,8 @@ import NavLogo from "../components/NavLogo";
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://stackpilot-oom6.onrender.com";
+
 const CodeExplain = () => {
   const [user, setUser] = useState(null);
   const navigate = useNavigate();
@@ -45,7 +47,7 @@ const CodeExplain = () => {
         ? await auth.currentUser.getIdToken()
         : "";
       const response = await fetch(
-        "https://stackpilot-oom6.onrender.com/api/code-explain",
+        `${API_BASE_URL}/api/code-explain`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

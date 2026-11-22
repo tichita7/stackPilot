@@ -6,6 +6,8 @@ import NavLogo from "../components/NavLogo";
 import CustomUserMenu from "../components/CustomUserMenu";
 import { useNavigate } from "react-router-dom";
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://stackpilot-oom6.onrender.com";
+
 const ReviewResume = () => {
   const [user, setUser] = useState(null);
   const navigate = useNavigate();
@@ -49,7 +51,7 @@ const ReviewResume = () => {
       formData.append("id_token", idToken);
 
       const response = await fetch(
-        "https://stackpilot-oom6.onrender.com/api/review-resume",
+        `${API_BASE_URL}/api/review-resume`,
         {
           method: "POST",
           body: formData,

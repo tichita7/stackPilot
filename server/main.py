@@ -17,6 +17,7 @@ import requests
 import base64
 import re
 import psycopg2
+import time
 
 load_dotenv()
 
@@ -75,6 +76,7 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ── Connection Pool ──────────────────────────────────────
 connection_pool = None
+HAS_METRICS_COLUMNS = False
 
 
 def init_pool():
@@ -135,6 +137,27 @@ def init_db():
         except Exception:
             conn.rollback()
 
+        # Check schema compatibility for metrics columns (Fix 4)
+        # Note: applying server/migrate_metrics_columns.py requires restarting the backend to refresh schema detection.
+        try:
+            cur.execute("""
+                SELECT COUNT(*) AS col_count
+                FROM information_schema.columns
+                WHERE table_name = 'sessions'
+                  AND column_name IN ('duration_ms', 'success');
+            """)
+            row = cur.fetchone()
+            count = row["col_count"] if isinstance(row, dict) and "col_count" in row else (row[0] if row else 0)
+            global HAS_METRICS_COLUMNS
+            HAS_METRICS_COLUMNS = (count == 2)
+            if HAS_METRICS_COLUMNS:
+                print("Database schema compatibility: metrics columns (duration_ms, success) active.")
+            else:
+                print("Database schema compatibility: metrics columns absent, using legacy mode.")
+        except Exception as schema_err:
+            print("Schema compatibility check notice:", schema_err)
+            HAS_METRICS_COLUMNS = False
+
         cur.close()
         release_db(conn)
         print("Database Infrastructure Successfully Provisioned.")
@@ -172,17 +195,33 @@ class UserSyncRequest(BaseModel):
 
 
 # ── Session Logger ───────────────────────────────────────
-def log_session(uid: str, tool: str, summary: str, tokens: int = 150):
+def log_session(
+    uid: str,
+    tool: str,
+    summary: str,
+    tokens: int = 150,
+    duration_ms: Optional[int] = None,
+    success: Optional[bool] = None
+):
     if not uid:
         return
     conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used) VALUES (%s, %s, %s, %s)",
-            (uid, tool, summary[:200], tokens)
-        )
+        if HAS_METRICS_COLUMNS:
+            cur.execute(
+                """
+                INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used, duration_ms, success)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (uid, tool, summary[:200], tokens, duration_ms, success)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used) VALUES (%s, %s, %s, %s)",
+                (uid, tool, summary[:200], tokens)
+            )
         conn.commit()
         cur.close()
     except Exception as e:
@@ -259,59 +298,129 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
         conn = get_db()
         cur = conn.cursor()
 
-        cur.execute("""
-            WITH
-            recent AS (
-                SELECT tool, input_summary, tokens_used,
-                       (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
-                FROM sessions
-                WHERE clerk_id = %s
-                ORDER BY created_at DESC
-                LIMIT 5
-            ),
-            weekly AS (
+        if HAS_METRICS_COLUMNS:
+            cur.execute("""
+                WITH
+                recent AS (
+                    SELECT tool, input_summary, tokens_used,
+                           (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND (success IS TRUE OR success IS NULL)
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                ),
+                weekly AS (
+                    SELECT
+                        DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
+                        COUNT(*) AS total_count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND (success IS TRUE OR success IS NULL)
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                    GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                ),
+                favorite AS (
+                    SELECT tool, COUNT(*) AS count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND (success IS TRUE OR success IS NULL)
+                    GROUP BY tool
+                    ORDER BY count DESC
+                    LIMIT 1
+                ),
+                prev_cycle AS (
+                    SELECT COUNT(*) AS total_count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND (success IS TRUE OR success IS NULL)
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                ),
+                active_dates AS (
+                    SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND (success IS TRUE OR success IS NULL)
+                ),
+                perf_metrics AS (
+                    SELECT
+                        AVG(duration_ms) FILTER (WHERE success IS TRUE AND duration_ms IS NOT NULL) AS avg_duration_ms,
+                        COUNT(*) FILTER (WHERE success IS NOT NULL) AS total_attempts,
+                        COUNT(*) FILTER (WHERE success IS TRUE) AS successful_attempts
+                    FROM sessions
+                    WHERE clerk_id = %s
+                )
                 SELECT
-                    DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
-                    COUNT(*) AS total_count
-                FROM sessions
-                WHERE clerk_id = %s
-                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-                GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ),
-            favorite AS (
-                SELECT tool, COUNT(*) AS count
-                FROM sessions
-                WHERE clerk_id = %s
-                GROUP BY tool
-                ORDER BY count DESC
-                LIMIT 1
-            ),
-            prev_cycle AS (
-                SELECT COUNT(*) AS total_count
-                FROM sessions
-                WHERE clerk_id = %s
-                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-            ),
-            active_dates AS (
-                SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
-                FROM sessions
-                WHERE clerk_id = %s
-            )
-            SELECT
-                (SELECT json_agg(recent) FROM recent) AS recent_sessions,
-                (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
-                (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
-                (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
-                (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days
-        """, (
-            uid,
-            uid, current_cycle_start, current_cycle_end,
-            uid,
-            uid, prev_cycle_start, prev_cycle_end,
-            uid
-        ))
+                    (SELECT json_agg(recent) FROM recent) AS recent_sessions,
+                    (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
+                    (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
+                    (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
+                    (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days,
+                    (SELECT row_to_json(perf_metrics) FROM perf_metrics) AS performance_metrics
+            """, (
+                uid,
+                uid, current_cycle_start, current_cycle_end,
+                uid,
+                uid, prev_cycle_start, prev_cycle_end,
+                uid,
+                uid
+            ))
+        else:
+            cur.execute("""
+                WITH
+                recent AS (
+                    SELECT tool, input_summary, tokens_used,
+                           (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
+                    FROM sessions
+                    WHERE clerk_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                ),
+                weekly AS (
+                    SELECT
+                        DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
+                        COUNT(*) AS total_count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                    GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                ),
+                favorite AS (
+                    SELECT tool, COUNT(*) AS count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                    GROUP BY tool
+                    ORDER BY count DESC
+                    LIMIT 1
+                ),
+                prev_cycle AS (
+                    SELECT COUNT(*) AS total_count
+                    FROM sessions
+                    WHERE clerk_id = %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                ),
+                active_dates AS (
+                    SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
+                    FROM sessions
+                    WHERE clerk_id = %s
+                )
+                SELECT
+                    (SELECT json_agg(recent) FROM recent) AS recent_sessions,
+                    (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
+                    (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
+                    (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
+                    (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days
+            """, (
+                uid,
+                uid, current_cycle_start, current_cycle_end,
+                uid,
+                uid, prev_cycle_start, prev_cycle_end,
+                uid
+            ))
 
         result = cur.fetchone()
         cur.close()
@@ -321,6 +430,24 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
         favorite_res = result["favorite_tool"]
         prev_cycle_count = int(result["prev_cycle_count"] or 0) if "prev_cycle_count" in result and result["prev_cycle_count"] is not None else 0
         active_days = result.get("active_days") or []
+
+        avg_latency = "—"
+        optimization_yield = "—"
+
+        if HAS_METRICS_COLUMNS and result.get("performance_metrics"):
+            perf = result["performance_metrics"]
+            avg_dur = perf.get("avg_duration_ms")
+            if avg_dur is not None:
+                avg_latency = f"{round(float(avg_dur))}ms"
+
+            total_attempts = perf.get("total_attempts") or 0
+            successful_attempts = perf.get("successful_attempts") or 0
+            if total_attempts > 0:
+                yield_pct = round((successful_attempts / total_attempts) * 100, 1)
+                if yield_pct == int(yield_pct):
+                    optimization_yield = f"{int(yield_pct)}%"
+                else:
+                    optimization_yield = f"{yield_pct:.1f}%"
 
         chart_data = []
         for day in days_array:
@@ -377,6 +504,8 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
                 "favorite_assistant": favorite_assistant,
                 "workspace_momentum": workspace_momentum,
                 "streak_count": streak_count,
+                "avg_latency": avg_latency,
+                "optimization_yield": optimization_yield,
             }
         }
 
@@ -393,9 +522,12 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
 async def debug(req: DebugRequest):
     uid = verify_firebase_token(req.id_token)
 
-    system_message = {
-        "role": "system",
-        "content": """You are an elite debugging engine. Return ONLY valid JSON:
+    start_time = time.perf_counter()
+    outcome_success = False
+    try:
+        system_message = {
+            "role": "system",
+            "content": """You are an elite debugging engine. Return ONLY valid JSON:
 {
   "confidence": 94,
   "rootCause": "...",
@@ -404,30 +536,34 @@ async def debug(req: DebugRequest):
   "prevention": ["Tip 1", "Tip 2"]
 }
 Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. No markdown fences."""
-    }
-    user_content = f"Language: {req.language}\nError:\n{req.error}\nCode:\n{req.code}"
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[system_message, {"role": "user", "content": user_content}]
-    )
-    content = response.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"```\w*", "", content).replace("```", "").strip()
-
-    # ✅ FIX: Log to database IMMEDIATELY before parsing JSON
-    log_session(uid, "debug-assistant", req.error[:100], tokens=240)
-
-    try:
-        data = json.loads(content)
-        return data
-    except Exception:
-        return {
-            "confidence": 50,
-            "rootCause": "Unable to analyze error context due to formatting mismatch.",
-            "technicalExplanation": [],
-            "fixedCode": "",
-            "prevention": []
         }
+        user_content = f"Language: {req.language}\nError:\n{req.error}\nCode:\n{req.code}"
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[system_message, {"role": "user", "content": user_content}]
+        )
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+
+        try:
+            data = json.loads(content)
+            outcome_success = True
+            return data
+        except Exception:
+            return {
+                "confidence": 50,
+                "rootCause": "Unable to analyze error context due to formatting mismatch.",
+                "technicalExplanation": [],
+                "fixedCode": "",
+                "prevention": []
+            }
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        try:
+            log_session(uid, "debug-assistant", req.error[:100], tokens=240, duration_ms=duration_ms, success=outcome_success)
+        except Exception as log_err:
+            print("Session Audit Logger Interrupted:", log_err)
 
 
 # ── Code Explain ─────────────────────────────────────────
@@ -435,9 +571,12 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
 async def explain(req: CodeRequest):
     uid = verify_firebase_token(req.id_token)
 
-    system_message = {
-    "role": "system",
-    "content": """You are an expert code analyzer and code explainer.
+    start_time = time.perf_counter()
+    outcome_success = False
+    try:
+        system_message = {
+            "role": "system",
+            "content": """You are an expert code analyzer and code explainer.
 
 First, analyze the provided code for correctness before explaining it.
 
@@ -467,29 +606,33 @@ Rules:
 - Provide accurate time and space complexity when it can be determined. If it cannot be determined because the code is incomplete or invalid, say so instead of guessing.
 - Improvements should contain useful corrections or suggestions relevant to the provided code.
 """
-}
-    user_content = f"Language: {req.language}\nCode:\n{req.code}"
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[system_message, {"role": "user", "content": user_content}]
-    )
-    content = response.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"```\w*", "", content).replace("```", "").strip()
-
-    # ✅ FIX: Log to database IMMEDIATELY
-    log_session(uid, "code-explain", req.code[:100], tokens=180)
-
-    try:
-        data = json.loads(content)
-        return data
-    except Exception:
-        return {
-            "summary": "Unable to compile structural breakdown",
-            "breakdown": [],
-            "complexity": {"time": "-", "space": "-"},
-            "improvements": []
         }
+        user_content = f"Language: {req.language}\nCode:\n{req.code}"
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[system_message, {"role": "user", "content": user_content}]
+        )
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+
+        try:
+            data = json.loads(content)
+            outcome_success = True
+            return data
+        except Exception:
+            return {
+                "summary": "Unable to compile structural breakdown",
+                "breakdown": [],
+                "complexity": {"time": "-", "space": "-"},
+                "improvements": []
+            }
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        try:
+            log_session(uid, "code-explain", req.code[:100], tokens=180, duration_ms=duration_ms, success=outcome_success)
+        except Exception as log_err:
+            print("Session Audit Logger Interrupted:", log_err)
 
 
 # ── Resume Review ─────────────────────────────────────────
@@ -497,17 +640,20 @@ Rules:
 async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
     uid = verify_firebase_token(id_token)
 
-    pdf_bytes = await file.read()
-    reader = PdfReader(BytesIO(pdf_bytes))
-    resume_text = ""
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            resume_text += text + "\n"
+    start_time = time.perf_counter()
+    outcome_success = False
+    try:
+        pdf_bytes = await file.read()
+        reader = PdfReader(BytesIO(pdf_bytes))
+        resume_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                resume_text += text + "\n"
 
-    system_message = {
-        "role": "system",
-        "content": """You are an expert ATS Resume Reviewer. Return ONLY valid JSON:
+        system_message = {
+            "role": "system",
+            "content": """You are an expert ATS Resume Reviewer. Return ONLY valid JSON:
 {
   "score": 85,
   "strengths": ["..."],
@@ -515,22 +661,29 @@ async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
   "keywords": ["..."]
 }
 Rules: Return ONLY JSON. No markdown. Score 0-100."""
-    }
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[system_message, {"role": "user", "content": resume_text}]
-    )
-    content = response.choices[0].message.content.strip()
-    try:
-        log_session(uid, "review-resume", "ATS Upload Optimization Analysis", tokens=310)
-        return json.loads(content)
-    except Exception:
-        return {
-            "score": 0,
-            "strengths": [],
-            "improvements": ["Processing failed cleanly. Retrying required."],
-            "keywords": []
         }
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[system_message, {"role": "user", "content": resume_text}]
+        )
+        content = response.choices[0].message.content.strip()
+        try:
+            data = json.loads(content)
+            outcome_success = True
+            return data
+        except Exception:
+            return {
+                "score": 0,
+                "strengths": [],
+                "improvements": ["Processing failed cleanly. Retrying required."],
+                "keywords": []
+            }
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        try:
+            log_session(uid, "review-resume", "ATS Upload Optimization Analysis", tokens=310, duration_ms=duration_ms, success=outcome_success)
+        except Exception as log_err:
+            print("Session Audit Logger Interrupted:", log_err)
 
 
 # ── Repository Copilot ────────────────────────────────────
@@ -538,13 +691,16 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
 async def repository_copilot(req: RepoRequest):
     uid = verify_firebase_token(req.id_token)
 
-    try:
-        match = re.search(r"github\.com/([^/]+)/([^/]+)", req.repo_url)
-        if not match:
-            return {"error": "Invalid GitHub repository location format. Use https://github.com/owner/repo"}
-        owner = match.group(1)
-        repo = match.group(2).replace(".git", "")
+    match = re.search(r"github\.com/([^/]+)/([^/]+)", req.repo_url)
+    if not match:
+        return {"error": "Invalid GitHub repository location format. Use https://github.com/owner/repo"}
 
+    owner = match.group(1)
+    repo = match.group(2).replace(".git", "")
+
+    start_time = time.perf_counter()
+    outcome_success = False
+    try:
         headers = {}
         github_token = os.getenv("GITHUB_TOKEN")
         if github_token:
@@ -621,11 +777,9 @@ Return ONLY the JSON object, no markdown, no explanation."""
 
         raw_content = response.choices[0].message.content.strip()
 
-        # ✅ FIX: Log to database IMMEDIATELY
-        log_session(uid, "repository-copilot", req.repo_url, tokens=450)
-
         try:
             content_data = json.loads(raw_content)
+            outcome_success = True
             return content_data
         except json.JSONDecodeError:
             raise Exception("LLM failed to generate parseable JSON.")
@@ -641,3 +795,9 @@ Return ONLY the JSON object, no markdown, no explanation."""
             "developer_insights": {},
             "change_plan": {}
         }
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        try:
+            log_session(uid, "repository-copilot", req.repo_url, tokens=450, duration_ms=duration_ms, success=outcome_success)
+        except Exception as log_err:
+            print("Session Audit Logger Interrupted:", log_err)
