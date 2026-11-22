@@ -520,10 +520,12 @@ const Dashboard = () => {
                   letterSpacing: "-1px",
                 }}
               >
-                {data.metrics.workspace_momentum.split(" ")[0]}
+                {data.metrics.workspace_momentum === "New activity"
+                  ? "New activity"
+                  : data.metrics.workspace_momentum.split(" ")[0]}
               </div>
               <div style={{ fontSize: 12, color: INK, marginTop: 2 }}>
-                Efficiency increase across nodes vs previous cycle.
+                Tool runs in the past 7 days vs previous 7-day cycle.
               </div>
             </div>
 

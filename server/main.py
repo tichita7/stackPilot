@@ -247,6 +247,15 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
 
     conn = None
     try:
+        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        today_ist = ist_now.date()
+        days_array = [(today_ist - timedelta(days=i)) for i in range(6, -1, -1)]
+
+        current_cycle_start = days_array[0]
+        current_cycle_end = days_array[-1]
+        prev_cycle_start = today_ist - timedelta(days=13)
+        prev_cycle_end = today_ist - timedelta(days=7)
+
         conn = get_db()
         cur = conn.cursor()
 
@@ -266,8 +275,8 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
                     COUNT(*) AS total_count
                 FROM sessions
                 WHERE clerk_id = %s
-                  AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-                      >= (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') - INTERVAL '7 days'
+                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
                 GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
             ),
             favorite AS (
@@ -277,12 +286,32 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
                 GROUP BY tool
                 ORDER BY count DESC
                 LIMIT 1
+            ),
+            prev_cycle AS (
+                SELECT COUNT(*) AS total_count
+                FROM sessions
+                WHERE clerk_id = %s
+                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                  AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+            ),
+            active_dates AS (
+                SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
+                FROM sessions
+                WHERE clerk_id = %s
             )
             SELECT
                 (SELECT json_agg(recent) FROM recent) AS recent_sessions,
                 (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
-                (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool
-        """, (uid, uid, uid))
+                (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
+                (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
+                (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days
+        """, (
+            uid,
+            uid, current_cycle_start, current_cycle_end,
+            uid,
+            uid, prev_cycle_start, prev_cycle_end,
+            uid
+        ))
 
         result = cur.fetchone()
         cur.close()
@@ -290,10 +319,8 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
         recent_sessions = result["recent_sessions"] or []
         db_metrics = result["weekly_metrics"] or []
         favorite_res = result["favorite_tool"]
-
-        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        today_ist = ist_now.date()
-        days_array = [(today_ist - timedelta(days=i)) for i in range(6, -1, -1)]
+        prev_cycle_count = int(result["prev_cycle_count"] or 0) if "prev_cycle_count" in result and result["prev_cycle_count"] is not None else 0
+        active_days = result.get("active_days") or []
 
         chart_data = []
         for day in days_array:
@@ -307,6 +334,37 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
                 "total": int(match["total_count"]) if match else 0
             })
 
+        current_cycle_count = sum(d["total"] for d in chart_data)
+
+        # ── Workspace Momentum ────────────────────────────────
+        if prev_cycle_count == 0:
+            if current_cycle_count > 0:
+                workspace_momentum = "New activity"
+            else:
+                workspace_momentum = "+0% growth vs last cycle"
+        else:
+            growth_pct = round(((current_cycle_count - prev_cycle_count) / prev_cycle_count) * 100)
+            sign = "+" if growth_pct >= 0 else ""
+            workspace_momentum = f"{sign}{growth_pct}% growth vs last cycle"
+
+        # ── Active-Day Streak ─────────────────────────────────
+        dates_set = set(str(d) for d in active_days)
+        streak = 0
+        if str(today_ist) in dates_set:
+            curr = today_ist
+            while str(curr) in dates_set:
+                streak += 1
+                curr -= timedelta(days=1)
+        elif str(today_ist - timedelta(days=1)) in dates_set:
+            curr = today_ist - timedelta(days=1)
+            while str(curr) in dates_set:
+                streak += 1
+                curr -= timedelta(days=1)
+        else:
+            streak = 0
+
+        streak_count = "1 Day Active" if streak == 1 else f"{streak} Days Active"
+
         if favorite_res and "tool" in favorite_res:
             favorite_assistant = f"{str(favorite_res['tool']).title()} ({favorite_res['count']} runs)"
         else:
@@ -317,8 +375,8 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
             "time_series_7d": chart_data,
             "metrics": {
                 "favorite_assistant": favorite_assistant,
-                "workspace_momentum": "+14% growth vs last cycle",
-                "streak_count": "5 Days Active",
+                "workspace_momentum": workspace_momentum,
+                "streak_count": streak_count,
             }
         }
 

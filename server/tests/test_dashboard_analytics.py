@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 import pytest
 import httpx
@@ -23,6 +24,11 @@ def make_request(path: str, headers: dict = None):
         ) as client:
             return await client.get(path, headers=headers)
     return asyncio.run(_fetch())
+
+
+def get_current_ist_date():
+    """Returns today's date in Asia/Kolkata (UTC+05:30)."""
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
 
 
 class TestDashboardAnalyticsAuthorization:
@@ -71,7 +77,6 @@ class TestDashboardAnalyticsAuthorization:
         assert res.status_code == 401
         assert "Invalid Firebase token" in res.json().get("detail", "")
         mock_get_db.assert_not_called()
-        # Verify no token is leaked in response
         assert "invalid_token_xyz" not in res.text
 
     @patch("main.get_db")
@@ -117,7 +122,6 @@ class TestDashboardAnalyticsAuthorization:
         )
 
         assert res.status_code == 401
-        # Confirm internal exception details are NOT leaked
         assert "Sensitive internal certificate error" not in res.text
         assert res.json().get("detail") == "Token verification failed."
         mock_get_db.assert_not_called()
@@ -147,7 +151,8 @@ class TestDashboardAnalyticsAuthorization:
         target_uid = "user_legitimate_123"
         mock_verify.return_value = {"uid": target_uid}
 
-        # Mock database connection and cursor
+        today_ist = get_current_ist_date()
+
         mock_conn = MagicMock()
         mock_cur = MagicMock()
         mock_get_db.return_value = mock_conn
@@ -159,19 +164,21 @@ class TestDashboardAnalyticsAuthorization:
                     "tool": "debug-assistant",
                     "input_summary": "Null pointer check",
                     "tokens_used": 150,
-                    "created_at": "2026-11-22T10:00:00"
+                    "created_at": f"{today_ist}T10:00:00"
                 }
             ],
             "weekly_metrics": [
                 {
-                    "session_date": "2026-11-22",
+                    "session_date": str(today_ist),
                     "total_count": 3
                 }
             ],
             "favorite_tool": {
                 "tool": "debug-assistant",
                 "count": 5
-            }
+            },
+            "prev_cycle_count": 2,
+            "active_days": [str(today_ist)]
         }
 
         res = make_request(
@@ -186,10 +193,339 @@ class TestDashboardAnalyticsAuthorization:
         assert "metrics" in data
         assert len(data["telemetry_stream"]) == 1
         assert data["metrics"]["favorite_assistant"] == "Debug-Assistant (5 runs)"
+        assert data["metrics"]["streak_count"] == "1 Day Active"
+        assert "+50% growth vs last cycle" in data["metrics"]["workspace_momentum"]
 
-        # Verify DB query was executed with target_uid
         mock_get_db.assert_called_once()
         mock_cur.execute.assert_called_once()
         query_args = mock_cur.execute.call_args[0][1]
-        assert query_args == (target_uid, target_uid, target_uid)
+        assert query_args[0] == target_uid
+        assert query_args[1] == target_uid
+        assert query_args[4] == target_uid
+        assert query_args[5] == target_uid
+        assert query_args[8] == target_uid
         mock_release_db.assert_called_once_with(mock_conn)
+
+
+class TestDashboardActivityMetrics:
+    """Test suite for real PostgreSQL metric calculations (Fix 3)."""
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_new_user_zero_sessions(self, mock_verify, mock_get_db, mock_release_db):
+        """New user with 0 sessions has zero growth and zero active days."""
+        uid = "user_new"
+        mock_verify.return_value = {"uid": uid}
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": None,
+            "favorite_tool": None,
+            "prev_cycle_count": 0,
+            "active_days": None,
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["workspace_momentum"] == "+0% growth vs last cycle"
+        assert data["metrics"]["streak_count"] == "0 Days Active"
+        assert data["metrics"]["favorite_assistant"] == "None (0 runs)"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_first_activity_new_activity_label(self, mock_verify, mock_get_db, mock_release_db):
+        """When previous cycle count = 0 and current cycle > 0, return 'New activity'."""
+        uid = "user_first_activity"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [{"session_date": str(today_ist), "total_count": 4}],
+            "favorite_tool": {"tool": "code-explain", "count": 4},
+            "prev_cycle_count": 0,
+            "active_days": [str(today_ist)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["workspace_momentum"] == "New activity"
+        assert data["metrics"]["streak_count"] == "1 Day Active"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_positive_growth_percentage(self, mock_verify, mock_get_db, mock_release_db):
+        """Current 6 vs previous 4 yields +50% growth."""
+        uid = "user_positive"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [{"session_date": str(today_ist), "total_count": 6}],
+            "favorite_tool": {"tool": "debug-assistant", "count": 6},
+            "prev_cycle_count": 4,
+            "active_days": [str(today_ist)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["workspace_momentum"] == "+50% growth vs last cycle"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_negative_growth_percentage(self, mock_verify, mock_get_db, mock_release_db):
+        """Current 2 vs previous 4 yields -50% growth."""
+        uid = "user_negative"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [{"session_date": str(today_ist), "total_count": 2}],
+            "favorite_tool": {"tool": "debug-assistant", "count": 2},
+            "prev_cycle_count": 4,
+            "active_days": [str(today_ist)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["workspace_momentum"] == "-50% growth vs last cycle"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_zero_growth_equal_cycles(self, mock_verify, mock_get_db, mock_release_db):
+        """Current 8 vs previous 8 yields +0% growth."""
+        uid = "user_equal"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [{"session_date": str(today_ist), "total_count": 8}],
+            "favorite_tool": {"tool": "debug-assistant", "count": 8},
+            "prev_cycle_count": 8,
+            "active_days": [str(today_ist)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["workspace_momentum"] == "+0% growth vs last cycle"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_consecutive_days_streak(self, mock_verify, mock_get_db, mock_release_db):
+        """Active today and previous 3 consecutive days yields '4 Days Active'."""
+        uid = "user_consecutive_streak"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+        day_1 = today_ist - timedelta(days=1)
+        day_2 = today_ist - timedelta(days=2)
+        day_3 = today_ist - timedelta(days=3)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [
+                {"session_date": str(today_ist), "total_count": 2},
+                {"session_date": str(day_1), "total_count": 3},
+                {"session_date": str(day_2), "total_count": 1},
+                {"session_date": str(day_3), "total_count": 4},
+            ],
+            "favorite_tool": {"tool": "debug-assistant", "count": 10},
+            "prev_cycle_count": 0,
+            "active_days": [str(today_ist), str(day_1), str(day_2), str(day_3)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["streak_count"] == "4 Days Active"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_yesterday_continuity_streak(self, mock_verify, mock_get_db, mock_release_db):
+        """When not yet active today, but active yesterday and 2 days ago, streak continues from yesterday."""
+        uid = "user_yesterday_streak"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+        day_1 = today_ist - timedelta(days=1)
+        day_2 = today_ist - timedelta(days=2)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [
+                {"session_date": str(day_1), "total_count": 3},
+                {"session_date": str(day_2), "total_count": 2},
+            ],
+            "favorite_tool": {"tool": "code-explain", "count": 5},
+            "prev_cycle_count": 0,
+            "active_days": [str(day_1), str(day_2)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["streak_count"] == "2 Days Active"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_broken_streak_with_gap(self, mock_verify, mock_get_db, mock_release_db):
+        """Active today, missed yesterday, active 2 days ago yields only '1 Day Active'."""
+        uid = "user_broken_streak"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+        day_2 = today_ist - timedelta(days=2)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [
+                {"session_date": str(today_ist), "total_count": 2},
+                {"session_date": str(day_2), "total_count": 5},
+            ],
+            "favorite_tool": {"tool": "debug-assistant", "count": 7},
+            "prev_cycle_count": 0,
+            "active_days": [str(today_ist), str(day_2)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["streak_count"] == "1 Day Active"
+
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_neither_today_nor_yesterday_active(self, mock_verify, mock_get_db, mock_release_db):
+        """Activity 2 days ago but neither today nor yesterday yields '0 Days Active'."""
+        uid = "user_inactive_streak"
+        mock_verify.return_value = {"uid": uid}
+
+        today_ist = get_current_ist_date()
+        day_2 = today_ist - timedelta(days=2)
+        day_3 = today_ist - timedelta(days=3)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": None,
+            "weekly_metrics": [
+                {"session_date": str(day_2), "total_count": 2},
+                {"session_date": str(day_3), "total_count": 5},
+            ],
+            "favorite_tool": {"tool": "debug-assistant", "count": 7},
+            "prev_cycle_count": 0,
+            "active_days": [str(day_2), str(day_3)],
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["metrics"]["streak_count"] == "0 Days Active"
