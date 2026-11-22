@@ -31,3 +31,11 @@ build
 .vercel
 coverage
 package-lock.json
+
+# Python
+server/venv/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -5,6 +5,8 @@ import { auth } from "../firebase";
 import NavLogo from "../components/NavLogo";
 import CustomUserMenu from "../components/CustomUserMenu";
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://stackpilot-oom6.onrender.com";
+
 const Dashboard = () => {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
@@ -33,7 +35,7 @@ const Dashboard = () => {
         const idToken = await auth.currentUser.getIdToken();
 
         // ✅ Fire sync in background — don't await it, don't let it block
-        fetch("https://stackpilot-oom6.onrender.com/api/sync-user", {
+        fetch(`${API_BASE_URL}/api/sync-user`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -45,7 +47,7 @@ const Dashboard = () => {
 
         // ✅ Fetch analytics immediately, parallel to sync
         const res = await fetch(
-          `https://stackpilot-oom6.onrender.com/api/dashboard-analytics/${user.uid}`,
+          `${API_BASE_URL}/api/dashboard-analytics/${user.uid}`,
           {
             headers: {
               Authorization: `Bearer ${idToken}`,

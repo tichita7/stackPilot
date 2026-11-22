@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 from groq import Groq
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -54,6 +55,8 @@ def verify_firebase_token(id_token: str) -> str:
     """
     if not id_token:
         return ""
+    if not firebase_admin._apps:
+        raise HTTPException(status_code=401, detail="Token verification unavailable.")
     try:
         decoded = firebase_auth.verify_id_token(id_token)
         return decoded["uid"]
@@ -61,8 +64,10 @@ def verify_firebase_token(id_token: str) -> str:
         raise HTTPException(status_code=401, detail="Firebase token has expired. Please sign in again.")
     except firebase_auth.InvalidIdTokenError:
         raise HTTPException(status_code=401, detail="Invalid Firebase token.")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token verification failed.")
 
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -224,7 +229,22 @@ async def sync_user(req: UserSyncRequest):
 
 # ── Dashboard Analytics ──────────────────────────────────
 @app.get("/api/dashboard-analytics/{uid}")
-async def get_dashboard_analytics(uid: str):
+async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required.")
+
+    parts = authorization.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Expected 'Bearer <token>'.")
+
+    id_token = parts[1].strip()
+    token_uid = verify_firebase_token(id_token)
+    if not token_uid:
+        raise HTTPException(status_code=401, detail="Invalid Firebase token.")
+
+    if token_uid != uid:
+        raise HTTPException(status_code=403, detail="Forbidden: UID mismatch.")
+
     conn = None
     try:
         conn = get_db()
