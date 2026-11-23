@@ -13,7 +13,8 @@ SERVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from main import app, normalize_repo_path
+from fastapi import HTTPException
+from main import app, normalize_repo_path, verify_firebase_token
 from firebase_admin import auth as firebase_auth
 
 
@@ -143,7 +144,7 @@ class TestDashboardAnalyticsAuthorization:
     @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
     @patch("main.firebase_auth.verify_id_token")
     def test_verification_fails_with_unexpected_error(self, mock_verify, mock_get_db):
-        """Internal verification failure must return 401 without exposing exception details."""
+        """Internal verification failure must return 503 without exposing exception details."""
         mock_verify.side_effect = RuntimeError("Sensitive internal certificate error")
 
         res = make_request(
@@ -151,9 +152,9 @@ class TestDashboardAnalyticsAuthorization:
             headers={"Authorization": "Bearer some_token"}
         )
 
-        assert res.status_code == 401
+        assert res.status_code == 503
         assert "Sensitive internal certificate error" not in res.text
-        assert res.json().get("detail") == "Token verification failed."
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
         mock_get_db.assert_not_called()
 
     @patch("main.get_db")
@@ -1775,4 +1776,426 @@ class TestRepositoryCopilotGroundingIntegration:
         # steps formatting verified
         assert data["change_plan"]["steps"][0] == "Update the main configuration"
         assert data["change_plan"]["steps"][1] == "Run the application"
+
+
+class TestVerifyFirebaseTokenUnit:
+    """Direct unit tests for verify_firebase_token."""
+
+    @pytest.mark.parametrize("bad_token", [
+        None,
+        "",
+        "   ",
+        "\t\n  ",
+        12345,
+        [],
+        {},
+    ])
+    def test_missing_or_empty_or_non_string_token_raises_401(self, bad_token):
+        """Tokens that are None, empty, whitespace-only, or not strings must raise HTTP 401."""
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token(bad_token)
+        assert exc_info.value.status_code == 401
+        assert "Authentication token required. Please sign in." in exc_info.value.detail
+
+    @patch("main.firebase_admin._apps", {})
+    def test_uninitialized_firebase_admin_raises_401(self):
+        """When Firebase Admin is uninitialized, raise HTTP 401."""
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token("valid_token_xyz")
+        assert exc_info.value.status_code == 401
+        assert "Token verification unavailable." in exc_info.value.detail
+
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_expired_token_raises_401(self, mock_verify):
+        """Expired Firebase token must raise HTTP 401."""
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Token expired", None)
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token("expired_token_123")
+        assert exc_info.value.status_code == 401
+        assert "Firebase token has expired. Please sign in again." in exc_info.value.detail
+
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_invalid_token_raises_401(self, mock_verify):
+        """Invalid Firebase token must raise HTTP 401."""
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token("invalid_token_123")
+        assert exc_info.value.status_code == 401
+        assert "Invalid Firebase token." in exc_info.value.detail
+
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_unexpected_verification_exception_raises_503(self, mock_verify):
+        """Unexpected internal verification error must raise generic HTTP 503."""
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token("token_triggering_crash")
+        assert exc_info.value.status_code == 503
+        assert "Authentication verification temporarily unavailable." in exc_info.value.detail
+
+    @pytest.mark.parametrize("bad_decoded", [
+        {},
+        {"uid": None},
+        {"uid": ""},
+        {"uid": "   "},
+        {"uid": 12345},
+    ])
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_decoded_token_missing_or_invalid_uid_raises_401(self, mock_verify, bad_decoded):
+        """Decoded token payload without a valid non-empty string UID must raise HTTP 401."""
+        mock_verify.return_value = bad_decoded
+        with pytest.raises(HTTPException) as exc_info:
+            verify_firebase_token("token_without_proper_uid")
+        assert exc_info.value.status_code == 401
+        assert "Invalid Firebase token: missing UID." in exc_info.value.detail
+
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_valid_token_returns_stripped_uid(self, mock_verify):
+        """Valid token returns stripped UID string and calls verify_id_token with stripped token."""
+        mock_verify.return_value = {"uid": "  usr_valid_abc_123  ", "email": "dev@example.com"}
+        uid = verify_firebase_token("  valid_token_abc  ")
+        assert uid == "usr_valid_abc_123"
+        mock_verify.assert_called_once_with("valid_token_abc")
+
+
+class TestAiToolsAuthenticationRejection:
+    """Security tests: AI endpoints must reject unauthenticated requests before any protected work."""
+
+    # ── Debug Assistant ──────────────────────────────────────────
+    @pytest.mark.parametrize("auth_payload", [
+        {},
+        {"id_token": ""},
+        {"id_token": "   "},
+    ])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    def test_debug_assistant_missing_or_blank_token_rejected(self, mock_llm, mock_log, auth_payload):
+        payload = {"error": "IndexError", "code": "arr[10]", "language": "python", **auth_payload}
+        res = make_post_request("/api/debug-assistant", json_data=payload)
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_debug_assistant_invalid_token_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "bad_token", "error": "IndexError"})
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_debug_assistant_expired_token_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Expired", None)
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "exp_token", "error": "IndexError"})
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_debug_assistant_unexpected_verification_error_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "some_token", "error": "IndexError"})
+        assert res.status_code == 503
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="")
+    def test_debug_assistant_empty_uid_guard_defense_in_depth(self, mock_verify, mock_llm, mock_log):
+        """Even if verify_firebase_token returns empty string, endpoint guard rejects with 401."""
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "dummy", "error": "IndexError"})
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    # ── Code Explain ─────────────────────────────────────────────
+    @pytest.mark.parametrize("auth_payload", [
+        {},
+        {"id_token": ""},
+        {"id_token": "   "},
+    ])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    def test_code_explain_missing_or_blank_token_rejected(self, mock_llm, mock_log, auth_payload):
+        payload = {"code": "x = 10", "language": "python", **auth_payload}
+        res = make_post_request("/api/code-explain", json_data=payload)
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_code_explain_invalid_token_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res = make_post_request("/api/code-explain", json_data={"id_token": "bad_token", "code": "x = 10"})
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_code_explain_expired_token_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Expired", None)
+        res = make_post_request("/api/code-explain", json_data={"id_token": "exp_token", "code": "x = 10"})
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_code_explain_unexpected_verification_error_rejected(self, mock_verify, mock_llm, mock_log):
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        res = make_post_request("/api/code-explain", json_data={"id_token": "some_token", "code": "x = 10"})
+        assert res.status_code == 503
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="")
+    def test_code_explain_empty_uid_guard_defense_in_depth(self, mock_verify, mock_llm, mock_log):
+        """Even if verify_firebase_token returns empty string, endpoint guard rejects with 401."""
+        res = make_post_request("/api/code-explain", json_data={"id_token": "dummy", "code": "x = 10"})
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    # ── Review Resume ────────────────────────────────────────────
+    @pytest.mark.parametrize("form_data", [
+        {},
+        {"id_token": ""},
+        {"id_token": "   "},
+    ])
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.client.chat.completions.create")
+    def test_review_resume_missing_or_blank_token_rejected(self, mock_llm, mock_pdf, mock_log, form_data):
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-dummy", "application/pdf")},
+            data=form_data
+        )
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_pdf.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_review_resume_invalid_token_rejected(self, mock_verify, mock_llm, mock_pdf, mock_log):
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-dummy", "application/pdf")},
+            data={"id_token": "bad_token"}
+        )
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_pdf.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_review_resume_expired_token_rejected(self, mock_verify, mock_llm, mock_pdf, mock_log):
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Expired", None)
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-dummy", "application/pdf")},
+            data={"id_token": "exp_token"}
+        )
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_pdf.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_review_resume_unexpected_verification_error_rejected(self, mock_verify, mock_llm, mock_pdf, mock_log):
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-dummy", "application/pdf")},
+            data={"id_token": "some_token"}
+        )
+        assert res.status_code == 503
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
+        mock_llm.assert_not_called()
+        mock_pdf.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="")
+    def test_review_resume_empty_uid_guard_defense_in_depth(self, mock_verify, mock_llm, mock_pdf, mock_log):
+        """Even if verify_firebase_token returns empty string, endpoint guard rejects with 401."""
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-dummy", "application/pdf")},
+            data={"id_token": "dummy"}
+        )
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_pdf.assert_not_called()
+        mock_log.assert_not_called()
+
+    # ── Repository Copilot ───────────────────────────────────────
+    @pytest.mark.parametrize("auth_payload", [
+        {},
+        {"id_token": ""},
+        {"id_token": "   "},
+    ])
+    @patch("main.log_session")
+    @patch("main.fetch_repository_context")
+    @patch("main.client.chat.completions.create")
+    def test_repository_copilot_missing_or_blank_token_rejected(self, mock_llm, mock_fetch_repo, mock_log, auth_payload):
+        payload = {"repo_url": "https://github.com/owner/repo", "goal": "Analyze", **auth_payload}
+        res = make_post_request("/api/repository-copilot", json_data=payload)
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_fetch_repo.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.fetch_repository_context")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_repository_copilot_invalid_token_rejected(self, mock_verify, mock_llm, mock_fetch_repo, mock_log):
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "bad_token", "repo_url": "https://github.com/owner/repo"}
+        )
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_fetch_repo.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.fetch_repository_context")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_repository_copilot_expired_token_rejected(self, mock_verify, mock_llm, mock_fetch_repo, mock_log):
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Expired", None)
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "exp_token", "repo_url": "https://github.com/owner/repo"}
+        )
+        assert res.status_code == 401
+        mock_llm.assert_not_called()
+        mock_fetch_repo.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.fetch_repository_context")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_repository_copilot_unexpected_verification_error_rejected(self, mock_verify, mock_llm, mock_fetch_repo, mock_log):
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "some_token", "repo_url": "https://github.com/owner/repo"}
+        )
+        assert res.status_code == 503
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
+        mock_llm.assert_not_called()
+        mock_fetch_repo.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.fetch_repository_context")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="")
+    def test_repository_copilot_empty_uid_guard_defense_in_depth(self, mock_verify, mock_llm, mock_fetch_repo, mock_log):
+        """Even if verify_firebase_token returns empty string, endpoint guard rejects with 401."""
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "dummy", "repo_url": "https://github.com/owner/repo"}
+        )
+        assert res.status_code == 401
+        assert "Authentication token required" in res.json().get("detail", "")
+        mock_llm.assert_not_called()
+        mock_fetch_repo.assert_not_called()
+        mock_log.assert_not_called()
+
+    # ── User Sync ────────────────────────────────────────────────
+    @pytest.mark.parametrize("bad_token", [
+        "",
+        "   ",
+    ])
+    @patch("main.get_db")
+    def test_sync_user_blank_token_rejected(self, mock_get_db, bad_token):
+        res = make_post_request("/api/sync-user", json_data={"id_token": bad_token, "email": "a@b.com", "name": "User"})
+        assert res.status_code == 401
+        mock_get_db.assert_not_called()
+
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_sync_user_invalid_token_rejected(self, mock_verify, mock_get_db):
+        mock_verify.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res = make_post_request("/api/sync-user", json_data={"id_token": "bad_token", "email": "a@b.com", "name": "User"})
+        assert res.status_code == 401
+        mock_get_db.assert_not_called()
+
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_sync_user_expired_token_rejected(self, mock_verify, mock_get_db):
+        mock_verify.side_effect = firebase_auth.ExpiredIdTokenError("Expired", None)
+        res = make_post_request("/api/sync-user", json_data={"id_token": "exp_token", "email": "a@b.com", "name": "User"})
+        assert res.status_code == 401
+        mock_get_db.assert_not_called()
+
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_sync_user_unexpected_verification_error_rejected(self, mock_verify, mock_get_db):
+        mock_verify.side_effect = RuntimeError("Crypto failure")
+        res = make_post_request("/api/sync-user", json_data={"id_token": "some_token", "email": "a@b.com", "name": "User"})
+        assert res.status_code == 503
+        assert res.json().get("detail") == "Authentication verification temporarily unavailable."
+        mock_get_db.assert_not_called()
 

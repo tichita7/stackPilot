@@ -52,16 +52,20 @@ else:
 def verify_firebase_token(id_token: str) -> str:
     """
     Verifies the Firebase ID token sent from the frontend.
-    Returns the Firebase UID (uid) if valid.
-    Raises HTTP 401 if invalid or expired.
+    Returns the verified non-empty Firebase UID (uid) if valid.
+    Raises HTTP 401 if missing, empty, whitespace-only, invalid, expired, or missing UID.
+    Raises HTTP 503 if verification infrastructure fails unexpectedly.
     """
-    if not id_token:
-        return ""
+    if not id_token or not isinstance(id_token, str) or not id_token.strip():
+        raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
     if not firebase_admin._apps:
         raise HTTPException(status_code=401, detail="Token verification unavailable.")
     try:
-        decoded = firebase_auth.verify_id_token(id_token)
-        return decoded["uid"]
+        decoded = firebase_auth.verify_id_token(id_token.strip())
+        uid = decoded.get("uid")
+        if not uid or not isinstance(uid, str) or not uid.strip():
+            raise HTTPException(status_code=401, detail="Invalid Firebase token: missing UID.")
+        return uid.strip()
     except firebase_auth.ExpiredIdTokenError:
         raise HTTPException(status_code=401, detail="Firebase token has expired. Please sign in again.")
     except firebase_auth.InvalidIdTokenError:
@@ -69,7 +73,7 @@ def verify_firebase_token(id_token: str) -> str:
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=401, detail="Token verification failed.")
+        raise HTTPException(status_code=503, detail="Authentication verification temporarily unavailable.")
 
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -522,6 +526,8 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
 @app.post("/api/debug-assistant")
 async def debug(req: DebugRequest):
     uid = verify_firebase_token(req.id_token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
 
     start_time = time.perf_counter()
     outcome_success = False
@@ -571,6 +577,8 @@ Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. N
 @app.post("/api/code-explain")
 async def explain(req: CodeRequest):
     uid = verify_firebase_token(req.id_token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
 
     start_time = time.perf_counter()
     outcome_success = False
@@ -640,6 +648,8 @@ Rules:
 @app.post("/api/review-resume")
 async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
     uid = verify_firebase_token(id_token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
 
     start_time = time.perf_counter()
     outcome_success = False
@@ -721,6 +731,8 @@ def normalize_repo_path(raw_path: str) -> str:
 @app.post("/api/repository-copilot")
 async def repository_copilot(req: RepoRequest):
     uid = verify_firebase_token(req.id_token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
 
     parsed = parse_github_url(req.repo_url)
     if not parsed:
