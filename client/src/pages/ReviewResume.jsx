@@ -43,10 +43,22 @@ const ReviewResume = () => {
     setResult(null);
 
     try {
-      const idToken = auth.currentUser
-        ? await auth.currentUser.getIdToken()
-        : "";
-      const formData = new FormData(); // ✅ formData after idToken
+      if (!auth.currentUser) {
+        throw new Error("Authentication required. Please sign in to use this tool.");
+      }
+
+      let idToken = "";
+      try {
+        idToken = await auth.currentUser.getIdToken();
+      } catch {
+        throw new Error("Unable to verify your session. Please sign in again.");
+      }
+
+      if (!idToken || !idToken.trim()) {
+        throw new Error("Authentication required. Please sign in again.");
+      }
+
+      const formData = new FormData();
       formData.append("file", file);
       formData.append("id_token", idToken);
 
@@ -58,7 +70,18 @@ const ReviewResume = () => {
         },
       );
 
-      if (!response.ok) throw new Error("Resume parsing service unavailable.");
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        if (response.status === 401) {
+          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
+        }
+        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+          throw new Error("Authentication verification temporarily unavailable.");
+        }
+        throw new Error("Resume parsing service unavailable.");
+      }
+
       const data = await response.json();
 
       setResult(data);

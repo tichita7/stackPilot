@@ -42,9 +42,21 @@ const RepositoryCopilot = () => {
     setResult(null);
 
     try {
-      const idToken = auth.currentUser 
-  ? await auth.currentUser.getIdToken() 
-  : "";
+      if (!auth.currentUser) {
+        throw new Error("Authentication required. Please sign in to use this tool.");
+      }
+
+      let idToken = "";
+      try {
+        idToken = await auth.currentUser.getIdToken();
+      } catch {
+        throw new Error("Unable to verify your session. Please sign in again.");
+      }
+
+      if (!idToken || !idToken.trim()) {
+        throw new Error("Authentication required. Please sign in again.");
+      }
+
       const response = await fetch(
         `${API_BASE_URL}/api/repository-copilot`,
         {
@@ -58,7 +70,18 @@ const RepositoryCopilot = () => {
         },
       );
 
-      if (!response.ok) throw new Error("Failed to map repository.");
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        if (response.status === 401) {
+          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
+        }
+        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+          throw new Error("Authentication verification temporarily unavailable.");
+        }
+        throw new Error("Failed to map repository.");
+      }
+
       const data = await response.json();
 
       if (data.error) throw new Error(data.error);
