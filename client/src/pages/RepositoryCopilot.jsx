@@ -584,20 +584,33 @@ const RepositoryCopilot = () => {
                       Targets
                     </div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      {result.change_plan?.files_to_modify?.map((f) => (
+                      {result.change_plan?.files_to_modify &&
+                      result.change_plan.files_to_modify.length > 0 ? (
+                        result.change_plan.files_to_modify.map((f) => (
+                          <span
+                            key={f}
+                            style={{
+                              background: "#222",
+                              padding: "4px 8px",
+                              borderRadius: 4,
+                              ...F,
+                              fontSize: 12,
+                            }}
+                          >
+                            {f}
+                          </span>
+                        ))
+                      ) : (
                         <span
-                          key={f}
                           style={{
-                            background: "#222",
-                            padding: "4px 8px",
-                            borderRadius: 4,
+                            color: INK2,
+                            fontSize: 13,
                             ...F,
-                            fontSize: 12,
                           }}
                         >
-                          {f}
+                          No specific files targeted for modification.
                         </span>
-                      ))}
+                      )}
                     </div>
                   </div>
                   <div
