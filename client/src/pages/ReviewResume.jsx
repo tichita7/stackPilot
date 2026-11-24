@@ -71,13 +71,24 @@ const ReviewResume = () => {
       );
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => null);
         if (response.status === 401) {
-          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          const detail = typeof errData?.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
           throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
         }
-        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+        if (response.status === 503 && errData?.detail === "Authentication verification temporarily unavailable.") {
           throw new Error("Authentication verification temporarily unavailable.");
+        }
+        if (response.status === 400) {
+          const detail = typeof errData?.detail === "string" ? errData.detail.trim() : "";
+          if (
+            detail === "Invalid or unreadable PDF document." ||
+            detail === "Password-protected PDF documents are not supported." ||
+            detail === "PDF document contains no readable text. Please upload a text-based PDF."
+          ) {
+            throw new Error(detail);
+          }
+          throw new Error("Unable to process this PDF. Please upload a valid, readable PDF document.");
         }
         throw new Error("Resume parsing service unavailable.");
       }

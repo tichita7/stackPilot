@@ -14,7 +14,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from fastapi import HTTPException
-from main import app, normalize_repo_path, verify_firebase_token
+from main import app, normalize_repo_path, verify_firebase_token, validate_resume_analysis
 from firebase_admin import auth as firebase_auth
 
 
@@ -819,7 +819,7 @@ class TestFix4EndpointTimingAndLogging:
     def test_review_resume_success(self, mock_verify, mock_llm, mock_pdf, mock_log):
         mock_page = MagicMock()
         mock_page.extract_text.return_value = "Experienced Software Engineer"
-        mock_pdf.return_value = MagicMock(pages=[mock_page])
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
 
         mock_choice = MagicMock()
         mock_choice.message.content = '{"score": 90, "strengths": ["Clear format"], "improvements": [], "keywords": ["Python"]}'
@@ -1023,8 +1023,9 @@ class TestFix4FailurePathsAndExclusions:
     @patch("main.PdfReader")
     @patch("main.verify_firebase_token", return_value="user_resume_err")
     def test_review_resume_corrupt_pdf_failure(self, mock_verify, mock_pdf, mock_log):
-        """Corrupt PDF in resume review logs success=False with positive duration and returns 500."""
-        mock_pdf.side_effect = Exception("Corrupt PDF stream or invalid trailer")
+        """Corrupt PDF in resume review logs success=False with positive duration and returns 400."""
+        from pypdf.errors import PdfReadError
+        mock_pdf.side_effect = PdfReadError("Corrupt PDF stream or invalid trailer")
 
         res = make_post_request(
             "/api/review-resume",
@@ -1032,7 +1033,8 @@ class TestFix4FailurePathsAndExclusions:
             data={"id_token": "token"}
         )
 
-        assert res.status_code == 500
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid or unreadable PDF document."
         mock_log.assert_called_once()
         args, kwargs = mock_log.call_args
         assert args[0] == "user_resume_err"
@@ -2590,4 +2592,880 @@ class TestDatabaseHygieneAndSafeErrors:
         out = capsys.readouterr().out
         assert "Database Connection Pool Release Error: RuntimeError" in out
         assert "postgres://user:pass@host/db" not in out
+
+
+class TestResumeReviewPdfAndLlmReliability:
+    """Regression test suite for Fix 7B PDF parsing and LLM response reliability."""
+
+    # 1. Empty uploaded file returns 400
+    @patch("main.log_session")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_empty_file_returns_400(self, mock_verify, mock_log):
+        """Empty upload file returns HTTP 400 and logs success=False."""
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("empty.pdf", b"", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid or unreadable PDF document."
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 2. Non-PDF content returns 400 without mocking PdfReader
+    @patch("main.log_session")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_non_pdf_content_returns_400(self, mock_verify, mock_log):
+        """Uploading plain text or random binary content returns HTTP 400."""
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("not_a_pdf.pdf", b"This is plain text, not a valid PDF binary.", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid or unreadable PDF document."
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 3. Encrypted PDF attribute returns 400 with specific detail
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_encrypted_pdf_attribute_returns_400(self, mock_verify, mock_pdf, mock_log):
+        """Password-protected PDF with is_encrypted=True returns specific 400 message."""
+        mock_reader = MagicMock()
+        mock_reader.is_encrypted = True
+        mock_pdf.return_value = mock_reader
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("locked.pdf", b"%PDF-1.4 encrypted content", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Password-protected PDF documents are not supported."
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 4. FileNotDecryptedError returns 400 with specific detail
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_file_not_decrypted_error_returns_400(self, mock_verify, mock_pdf, mock_log):
+        """FileNotDecryptedError during parsing returns specific 400 message."""
+        from pypdf.errors import FileNotDecryptedError
+        mock_pdf.side_effect = FileNotDecryptedError("File has not been decrypted")
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("locked.pdf", b"%PDF-1.4 encrypted content", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Password-protected PDF documents are not supported."
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 5. Unexpected internal server error remains 500
+    @patch("main.log_session")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_unexpected_internal_error_returns_500(self, mock_verify, mock_pdf, mock_log):
+        """Unexpected non-PDF errors must not be classified as 400 client errors."""
+        mock_pdf.side_effect = RuntimeError("Host kernel memory fault")
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("resume.pdf", b"%PDF-1.4 dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 500
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 6. Blank extracted text returns 400 without calling Groq
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_blank_extracted_text_returns_400(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Document with blank extracted text returns 400 and never calls Groq."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = ""
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("blank.pdf", b"%PDF-1.4 dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "PDF document contains no readable text. Please upload a text-based PDF."
+        mock_llm.assert_not_called()
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 7. Whitespace-only extracted text returns 400 without calling Groq
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_whitespace_only_text_returns_400(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Document with whitespace-only text returns 400 and never calls Groq."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "   \n\t   \n   "
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("whitespace.pdf", b"%PDF-1.4 dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "PDF document contains no readable text. Please upload a text-based PDF."
+        mock_llm.assert_not_called()
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 8. All pages returning None (e.g. scanned image PDF) returns 400
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_all_pages_none_returns_400(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Scanned document where extract_text() returns None on all pages returns 400."""
+        mock_page1 = MagicMock()
+        mock_page1.extract_text.return_value = None
+        mock_page2 = MagicMock()
+        mock_page2.extract_text.return_value = None
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page1, mock_page2])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("scanned.pdf", b"%PDF-1.4 dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "PDF document contains no readable text. Please upload a text-based PDF."
+        mock_llm.assert_not_called()
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 9. Mixed readable and textless pages preserves readable text
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_mixed_readable_and_textless_pages_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Multi-page document with an image page and text page preserves readable text."""
+        mock_page1 = MagicMock()
+        mock_page1.extract_text.return_value = None
+        mock_page2 = MagicMock()
+        mock_page2.extract_text.return_value = "Senior Software Engineer with 8 years Python experience"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page1, mock_page2])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 88, "strengths": ["Strong Python"], "improvements": [], "keywords": ["Python"]}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("mixed.pdf", b"%PDF-1.4 dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 88
+        mock_llm.assert_called_once()
+        user_prompt = mock_llm.call_args[1]["messages"][1]["content"]
+        assert "Senior Software Engineer with 8 years Python experience" in user_prompt
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 10. Plain JSON without fences succeeds
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_plain_json_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Plain valid JSON response from Groq succeeds with success=True."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 92, "strengths": ["Leadership"], "improvements": [], "keywords": ["Go"]}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 92
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 11. Whitespace-surrounded JSON succeeds
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_whitespace_surrounded_json_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """JSON surrounded by newlines and spaces succeeds."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '  \n\n  {"score": 85, "strengths": ["Clean code"], "improvements": [], "keywords": []}  \n  '
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 85
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 12. Markdown-fenced JSON succeeds
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_markdown_fenced_json_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """JSON enclosed in triple-backtick fences without language tag succeeds."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '```\n{"score": 79, "strengths": ["Architecture"], "improvements": [], "keywords": ["AWS"]}\n```'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 79
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 13. Markdown json-language fenced output succeeds
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_markdown_json_language_fenced_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """JSON enclosed in ```json ... ``` fences succeeds."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '```json\n{"score": 83, "strengths": ["Docker"], "improvements": ["Add tests"], "keywords": ["CI/CD"]}\n```'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 83
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 14. Legitimate backticks inside JSON string values are preserved
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_preserves_legitimate_backticks_in_json_values(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Enclosing fences are removed without stripping legitimate backticks from inside JSON string values."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '```json\n{"score": 90, "strengths": ["Proficient with `pytest` and `pydantic`"], "improvements": ["Highlight ```Kubernetes```"], "keywords": ["Python"]}\n```'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 90
+        assert data["strengths"][0] == "Proficient with `pytest` and `pydantic`"
+        assert data["improvements"][0] == "Highlight ```Kubernetes```"
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 15. Malformed JSON returns safe fallback schema with success=False
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_malformed_json_returns_safe_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Non-JSON plain text from Groq returns HTTP 200 fallback and logs success=False."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "I am an AI and I cannot evaluate this document."
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 0
+        assert data["improvements"] == ["Processing failed cleanly. Retrying required."]
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 16. Non-dict JSON (array or primitive) returns safe fallback schema with success=False
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_non_dict_json_returns_safe_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """JSON array returned by model is rejected as non-object and returns fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '[{"score": 90}]'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 0
+        assert data["improvements"] == ["Processing failed cleanly. Retrying required."]
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 17. Session logging failure does not mask successful response
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_logging_failure_preserves_response(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """If log_session raises an exception, the HTTP 200 response is still returned to the client."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 95, "strengths": ["Top candidate"], "improvements": [], "keywords": ["Python"]}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+        mock_log.side_effect = RuntimeError("Database down during logging")
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 95
+
+    # 18. Page extraction raising PdfReadError returns 400 and never calls Groq
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_page_raises_pdfreaderror_returns_400(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Unrecoverable text extraction failure on any page returns 400 without calling Groq."""
+        from pypdf.errors import PdfReadError
+        mock_page1 = MagicMock()
+        mock_page1.extract_text.return_value = "Good page"
+        mock_page2 = MagicMock()
+        mock_page2.extract_text.side_effect = PdfReadError("Corrupt font descriptor")
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page1, mock_page2])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid or unreadable PDF document."
+        mock_llm.assert_not_called()
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 19. Page extraction raising encryption error returns 400 and never calls Groq
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_page_raises_encryption_error_returns_400(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Page extraction triggering FileNotDecryptedError returns specific 400 detail."""
+        from pypdf.errors import FileNotDecryptedError
+        mock_page = MagicMock()
+        mock_page.extract_text.side_effect = FileNotDecryptedError("Page content encrypted")
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Password-protected PDF documents are not supported."
+        mock_llm.assert_not_called()
+        mock_log.assert_called_once()
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 20. Empty JSON object triggers safe fallback with success=False
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_empty_object_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Empty JSON object from model is rejected and triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "{}"
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 0
+        assert data["improvements"] == ["Processing failed cleanly. Retrying required."]
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 21. Missing required fields trigger safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_missing_required_fields_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """JSON missing improvements and keywords triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 85, "strengths": ["Fast learner"]}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 0
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 22. Invalid field types (non-array strengths/keywords) trigger safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_invalid_field_types_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Non-array strengths or keywords triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 85, "strengths": "Good communicator", "improvements": [], "keywords": 123}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 0
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 23. Null field values trigger safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_null_field_values_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Null score or strengths triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": null, "strengths": null, "improvements": [], "keywords": []}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 0
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 24. Invalid score range and boolean score trigger safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_invalid_score_values_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Boolean score or out-of-range score triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        # Test boolean score: true
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": true, "strengths": [], "improvements": [], "keywords": []}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_bool = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_bool.status_code == 200
+        assert res_bool.json()["score"] == 0
+
+        # Test score > 100
+        mock_choice.message.content = '{"score": 105, "strengths": [], "improvements": [], "keywords": []}'
+        res_high = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_high.status_code == 200
+        assert res_high.json()["score"] == 0
+
+        # Test score < 0
+        mock_choice.message.content = '{"score": -5, "strengths": [], "improvements": [], "keywords": []}'
+        res_neg = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_neg.status_code == 200
+        assert res_neg.json()["score"] == 0
+
+    # 25. Valid empty arrays and harmless additional fields succeed
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_valid_empty_arrays_and_extra_fields_succeeds(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Empty lists for strengths/improvements and extra summary field succeed with success=True."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"score": 80, "strengths": [], "improvements": [], "keywords": ["Python"], "summary": "Harmless extra field"}'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["score"] == 80
+        assert data["summary"] == "Harmless extra field"
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is True
+
+    # 26. Groq empty choices triggers safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_groq_empty_choices_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Groq returning empty choices list triggers fallback schema with success=False."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_llm.return_value = MagicMock(choices=[])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 0
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 27. Groq None or whitespace-only content triggers safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_groq_none_or_empty_content_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Groq message.content as None or whitespace triggers fallback schema with success=False."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = None
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_none = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_none.status_code == 200
+        assert res_none.json()["score"] == 0
+
+        mock_choice.message.content = "   \n\t  "
+        res_ws = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_ws.status_code == 200
+        assert res_ws.json()["score"] == 0
+
+    # 28. Groq unexpected content type triggers safe fallback
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_groq_unexpected_content_type_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Groq message.content as non-string type triggers fallback schema."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = 99999
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 200
+        assert res.json()["score"] == 0
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 29. Groq upstream SDK/network exception triggers HTTP 500 without leaking raw details
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_groq_upstream_exception_returns_500(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Groq client network or SDK exception triggers HTTP 500 and records success=False."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_llm.side_effect = RuntimeError("Upstream API connection timeout to https://api.groq.com with sk-secret-key")
+
+        res = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Resume analysis service temporarily unavailable."
+        assert "Upstream API connection timeout" not in res.text
+        assert "sk-secret-key" not in res.text
+        assert "https://api.groq.com" not in res.text
+        _, kwargs = mock_log.call_args
+        assert kwargs["success"] is False
+
+    # 30. Non-string elements in arrays trigger fallback schema with success=False
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.PdfReader")
+    @patch("main.verify_firebase_token", return_value="user_pdf_val")
+    def test_review_resume_non_string_array_elements_returns_fallback(self, mock_verify, mock_pdf, mock_llm, mock_log):
+        """Arrays containing dicts, nested lists, nulls, numbers, or booleans trigger safe fallback."""
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Resume text"
+        mock_pdf.return_value = MagicMock(is_encrypted=False, pages=[mock_page])
+
+        mock_choice = MagicMock()
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        # Test dict in strengths
+        mock_choice.message.content = '{"score": 85, "strengths": [{"text": "Leadership"}], "improvements": [], "keywords": []}'
+        res_dict = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_dict.status_code == 200
+        assert res_dict.json()["score"] == 0
+        assert mock_log.call_args[1]["success"] is False
+
+        # Test nested list in improvements
+        mock_choice.message.content = '{"score": 85, "strengths": [], "improvements": [["Nested", "list"]], "keywords": []}'
+        res_list = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_list.status_code == 200
+        assert res_list.json()["score"] == 0
+        assert mock_log.call_args[1]["success"] is False
+
+        # Test null in keywords
+        mock_choice.message.content = '{"score": 85, "strengths": [], "improvements": [], "keywords": [null]}'
+        res_null = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_null.status_code == 200
+        assert res_null.json()["score"] == 0
+        assert mock_log.call_args[1]["success"] is False
+
+        # Test number in keywords
+        mock_choice.message.content = '{"score": 85, "strengths": [], "improvements": [], "keywords": [404]}'
+        res_num = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_num.status_code == 200
+        assert res_num.json()["score"] == 0
+        assert mock_log.call_args[1]["success"] is False
+
+        # Test boolean in strengths
+        mock_choice.message.content = '{"score": 85, "strengths": [true], "improvements": [], "keywords": []}'
+        res_bool = make_post_request(
+            "/api/review-resume",
+            files={"file": ("r.pdf", b"%PDF dummy", "application/pdf")},
+            data={"id_token": "valid_token"}
+        )
+        assert res_bool.status_code == 200
+        assert res_bool.json()["score"] == 0
+        assert mock_log.call_args[1]["success"] is False
+
+    # 31. Direct validator unit tests for schema, score, and array item types
+    def test_validate_resume_analysis_comprehensive(self):
+        """Comprehensive verification of validate_resume_analysis rules."""
+        import math
+
+        # Non-dict inputs
+        assert validate_resume_analysis(None) is False
+        assert validate_resume_analysis("invalid") is False
+        assert validate_resume_analysis(123) is False
+        assert validate_resume_analysis([]) is False
+
+        # Valid minimal payload
+        valid_payload = {
+            "score": 85,
+            "strengths": ["Strong background"],
+            "improvements": ["Add metrics"],
+            "keywords": ["Python", "FastAPI"]
+        }
+        assert validate_resume_analysis(valid_payload) is True
+
+        # Score boundaries: 0 and 100 valid
+        assert validate_resume_analysis({**valid_payload, "score": 0}) is True
+        assert validate_resume_analysis({**valid_payload, "score": 100}) is True
+        assert validate_resume_analysis({**valid_payload, "score": 50.5}) is True
+
+        # Invalid score ranges
+        assert validate_resume_analysis({**valid_payload, "score": -0.1}) is False
+        assert validate_resume_analysis({**valid_payload, "score": 100.1}) is False
+        assert validate_resume_analysis({**valid_payload, "score": -1}) is False
+        assert validate_resume_analysis({**valid_payload, "score": 101}) is False
+
+        # Invalid score types: boolean, NaN, inf, -inf
+        assert validate_resume_analysis({**valid_payload, "score": True}) is False
+        assert validate_resume_analysis({**valid_payload, "score": False}) is False
+        assert validate_resume_analysis({**valid_payload, "score": float("nan")}) is False
+        assert validate_resume_analysis({**valid_payload, "score": float("inf")}) is False
+        assert validate_resume_analysis({**valid_payload, "score": float("-inf")}) is False
+        assert validate_resume_analysis({**valid_payload, "score": "85"}) is False
+        assert validate_resume_analysis({**valid_payload, "score": None}) is False
+
+        # Missing or non-list fields
+        for field in ("strengths", "improvements", "keywords"):
+            p1 = {**valid_payload}
+            del p1[field]
+            assert validate_resume_analysis(p1) is False
+
+            p2 = {**valid_payload, field: "not a list"}
+            assert validate_resume_analysis(p2) is False
+
+            p3 = {**valid_payload, field: None}
+            assert validate_resume_analysis(p3) is False
+
+        # Non-string array items
+        invalid_items = [{"nested": 1}, [1, 2], None, 123, 45.6, True, False]
+        for field in ("strengths", "improvements", "keywords"):
+            for bad_item in invalid_items:
+                bad_payload = {**valid_payload, field: ["valid", bad_item]}
+                assert validate_resume_analysis(bad_payload) is False
+
+        # Valid empty lists
+        assert validate_resume_analysis({
+            "score": 0,
+            "strengths": [],
+            "improvements": [],
+            "keywords": []
+        }) is True
+
+        # Permitted extra fields
+        assert validate_resume_analysis({
+            **valid_payload,
+            "extra_field": "harmless",
+            "metadata": {"version": 1}
+        }) is True
 

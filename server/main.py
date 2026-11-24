@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from groq import Groq
 from dotenv import load_dotenv
-from pypdf import PdfReader
+from pypdf import PdfReader, errors as pypdf_errors
 from io import BytesIO
 from datetime import datetime, timedelta
 from psycopg2.extras import RealDictCursor
@@ -18,6 +18,7 @@ import base64
 import re
 import psycopg2
 import time
+import math
 from github_service import fetch_repository_context, parse_github_url
 
 load_dotenv()
@@ -712,6 +713,35 @@ Rules:
             print("Session Audit Logger Interrupted:", log_err)
 
 
+def validate_resume_analysis(data) -> bool:
+    """
+    Validates that parsed LLM output conforms to the expected resume analysis shape:
+    - Must be a dictionary.
+    - 'score' must be a finite numeric (int or float, not boolean, not NaN/inf) between 0 and 100.
+    - 'strengths', 'improvements', and 'keywords' must be lists where every element is a string.
+    - Harmless extra fields are permitted.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    score = data.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return False
+    if math.isnan(score) or math.isinf(score):
+        return False
+    if not (0 <= score <= 100):
+        return False
+
+    for field in ("strengths", "improvements", "keywords"):
+        val = data.get(field)
+        if not isinstance(val, list):
+            return False
+        if not all(isinstance(item, str) for item in val):
+            return False
+
+    return True
+
+
 # ── Resume Review ─────────────────────────────────────────
 @app.post("/api/review-resume")
 async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
@@ -723,12 +753,43 @@ async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
     outcome_success = False
     try:
         pdf_bytes = await file.read()
-        reader = PdfReader(BytesIO(pdf_bytes))
-        resume_text = ""
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                resume_text += text + "\n"
+        if not pdf_bytes or len(pdf_bytes.strip()) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unreadable PDF document."
+            )
+
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if reader.is_encrypted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Password-protected PDF documents are not supported."
+                )
+
+            resume_text = ""
+            for page in reader.pages:
+                text = page.extract_text()
+                if text and text.strip():
+                    resume_text += text + "\n"
+        except HTTPException:
+            raise
+        except (pypdf_errors.FileNotDecryptedError, pypdf_errors.WrongPasswordError):
+            raise HTTPException(
+                status_code=400,
+                detail="Password-protected PDF documents are not supported."
+            )
+        except (pypdf_errors.PdfReadError, pypdf_errors.ParseError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unreadable PDF document."
+            )
+
+        if not resume_text or not resume_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="PDF document contains no readable text. Please upload a text-based PDF."
+            )
 
         system_message = {
             "role": "system",
@@ -741,13 +802,41 @@ async def review_resume(id_token: str = Form(""), file: UploadFile = File(...)):
 }
 Rules: Return ONLY JSON. No markdown. Score 0-100."""
         }
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[system_message, {"role": "user", "content": resume_text}]
-        )
-        content = response.choices[0].message.content.strip()
+
         try:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[system_message, {"role": "user", "content": resume_text}]
+            )
+        except HTTPException:
+            raise
+        except Exception as upstream_err:
+            print("Resume Review Groq Upstream Error:", type(upstream_err).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Resume analysis service temporarily unavailable."
+            )
+
+        try:
+            choices = getattr(response, "choices", None)
+            if not choices:
+                raise ValueError("Groq response contains no choices")
+            message = getattr(choices[0], "message", None)
+            raw_content = getattr(message, "content", None)
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                raise ValueError("Groq response content is empty or invalid")
+            content = raw_content.strip()
+
+            # Safely normalize enclosing Markdown fences without stripping backticks from JSON values
+            if content.startswith("```"):
+                fence_match = re.match(r"^```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)\s*```$", content, re.DOTALL)
+                if fence_match:
+                    content = fence_match.group(1).strip()
+
             data = json.loads(content)
+            if not validate_resume_analysis(data):
+                raise ValueError("Response payload does not match required resume analysis shape")
+
             outcome_success = True
             return data
         except Exception:
@@ -762,7 +851,7 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
         try:
             log_session(uid, "review-resume", "ATS Upload Optimization Analysis", tokens=310, duration_ms=duration_ms, success=outcome_success)
         except Exception as log_err:
-            print("Session Audit Logger Interrupted:", log_err)
+            print("Session Audit Logger Interrupted:", type(log_err).__name__)
 
 
 # ── Repository Copilot ────────────────────────────────────
