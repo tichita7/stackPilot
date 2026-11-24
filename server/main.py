@@ -98,8 +98,16 @@ def get_db():
     return connection_pool.getconn()
 
 
-def release_db(conn):
-    connection_pool.putconn(conn)
+def release_db(conn, close: bool = False):
+    if not conn or not connection_pool:
+        return
+    try:
+        if close:
+            connection_pool.putconn(conn, close=True)
+        else:
+            connection_pool.putconn(conn)
+    except Exception as e:
+        print("Database Connection Pool Release Error:", type(e).__name__)
 
 
 def init_db():
@@ -211,29 +219,44 @@ def log_session(
     if not uid:
         return
     conn = None
+    close_conn = False
     try:
         conn = get_db()
         cur = conn.cursor()
-        if HAS_METRICS_COLUMNS:
-            cur.execute(
-                """
-                INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used, duration_ms, success)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (uid, tool, summary[:200], tokens, duration_ms, success)
-            )
-        else:
-            cur.execute(
-                "INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used) VALUES (%s, %s, %s, %s)",
-                (uid, tool, summary[:200], tokens)
-            )
-        conn.commit()
-        cur.close()
+        try:
+            if HAS_METRICS_COLUMNS:
+                cur.execute(
+                    """
+                    INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used, duration_ms, success)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (uid, tool, summary[:200], tokens, duration_ms, success)
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO sessions (clerk_id, tool, input_summary, tokens_used) VALUES (%s, %s, %s, %s)",
+                    (uid, tool, summary[:200], tokens)
+                )
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception as cur_err:
+                print("Session cursor close failed:", type(cur_err).__name__)
     except Exception as e:
-        print("Session Audit Logger Interrupted:", e)
+        print("Session Audit Logger Interrupted:", type(e).__name__)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_err:
+                print("Session rollback failed:", type(rb_err).__name__)
+                close_conn = True
     finally:
         if conn:
-            release_db(conn)
+            if close_conn:
+                release_db(conn, close=True)
+            else:
+                release_db(conn)
 
 
 # ── Root ─────────────────────────────────────────────────
@@ -250,25 +273,44 @@ async def sync_user(req: UserSyncRequest):
         raise HTTPException(status_code=401, detail="Valid Firebase token required for sync.")
 
     conn = None
+    close_conn = False
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (clerk_id, email, name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (clerk_id) DO UPDATE
-            SET email = EXCLUDED.email, name = EXCLUDED.name
-        """, (uid, req.email, req.name))
-        conn.commit()
-        cur.close()
+        try:
+            cur.execute("""
+                INSERT INTO users (clerk_id, email, name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (clerk_id) DO UPDATE
+                SET email = EXCLUDED.email, name = EXCLUDED.name
+            """, (uid, req.email, req.name))
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception as cur_err:
+                print("User Sync cursor close failed:", type(cur_err).__name__)
         return {"status": "synchronized", "uid": uid}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("User Sync Database Error:", type(e).__name__)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_err:
+                print("User Sync rollback failed:", type(rb_err).__name__)
+                close_conn = True
+        raise HTTPException(
+            status_code=500,
+            detail="Database operation failed. Please try again later."
+        )
     finally:
         if conn:
-            release_db(conn)
+            if close_conn:
+                release_db(conn, close=True)
+            else:
+                release_db(conn)
 
 
 # ── Dashboard Analytics ──────────────────────────────────
@@ -290,6 +332,7 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
         raise HTTPException(status_code=403, detail="Forbidden: UID mismatch.")
 
     conn = None
+    close_conn = False
     try:
         ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
         today_ist = ist_now.date()
@@ -302,133 +345,144 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
 
         conn = get_db()
         cur = conn.cursor()
+        try:
+            if HAS_METRICS_COLUMNS:
+                cur.execute("""
+                    WITH
+                    recent AS (
+                        SELECT tool, input_summary, tokens_used,
+                               (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND (success IS TRUE OR success IS NULL)
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                    ),
+                    weekly AS (
+                        SELECT
+                            DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
+                            COUNT(*) AS total_count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND (success IS TRUE OR success IS NULL)
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                        GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                    ),
+                    favorite AS (
+                        SELECT tool, COUNT(*) AS count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND (success IS TRUE OR success IS NULL)
+                        GROUP BY tool
+                        ORDER BY count DESC
+                        LIMIT 1
+                    ),
+                    prev_cycle AS (
+                        SELECT COUNT(*) AS total_count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND (success IS TRUE OR success IS NULL)
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                    ),
+                    active_dates AS (
+                        SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND (success IS TRUE OR success IS NULL)
+                    ),
+                    perf_metrics AS (
+                        SELECT
+                            AVG(duration_ms) FILTER (WHERE success IS TRUE AND duration_ms IS NOT NULL) AS avg_duration_ms,
+                            COUNT(*) FILTER (WHERE success IS NOT NULL) AS total_attempts,
+                            COUNT(*) FILTER (WHERE success IS TRUE) AS successful_attempts
+                        FROM sessions
+                        WHERE clerk_id = %s
+                    )
+                    SELECT
+                        (SELECT json_agg(recent) FROM recent) AS recent_sessions,
+                        (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
+                        (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
+                        (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
+                        (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days,
+                        (SELECT row_to_json(perf_metrics) FROM perf_metrics) AS performance_metrics
+                """, (
+                    uid,
+                    uid, current_cycle_start, current_cycle_end,
+                    uid,
+                    uid, prev_cycle_start, prev_cycle_end,
+                    uid,
+                    uid
+                ))
+            else:
+                cur.execute("""
+                    WITH
+                    recent AS (
+                        SELECT tool, input_summary, tokens_used,
+                               (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
+                        FROM sessions
+                        WHERE clerk_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                    ),
+                    weekly AS (
+                        SELECT
+                            DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
+                            COUNT(*) AS total_count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                        GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                    ),
+                    favorite AS (
+                        SELECT tool, COUNT(*) AS count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                        GROUP BY tool
+                        ORDER BY count DESC
+                        LIMIT 1
+                    ),
+                    prev_cycle AS (
+                        SELECT COUNT(*) AS total_count
+                        FROM sessions
+                        WHERE clerk_id = %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
+                          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
+                    ),
+                    active_dates AS (
+                        SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
+                        FROM sessions
+                        WHERE clerk_id = %s
+                    )
+                    SELECT
+                        (SELECT json_agg(recent) FROM recent) AS recent_sessions,
+                        (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
+                        (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
+                        (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
+                        (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days
+                """, (
+                    uid,
+                    uid, current_cycle_start, current_cycle_end,
+                    uid,
+                    uid, prev_cycle_start, prev_cycle_end,
+                    uid
+                ))
 
-        if HAS_METRICS_COLUMNS:
-            cur.execute("""
-                WITH
-                recent AS (
-                    SELECT tool, input_summary, tokens_used,
-                           (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND (success IS TRUE OR success IS NULL)
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                ),
-                weekly AS (
-                    SELECT
-                        DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
-                        COUNT(*) AS total_count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND (success IS TRUE OR success IS NULL)
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-                    GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-                ),
-                favorite AS (
-                    SELECT tool, COUNT(*) AS count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND (success IS TRUE OR success IS NULL)
-                    GROUP BY tool
-                    ORDER BY count DESC
-                    LIMIT 1
-                ),
-                prev_cycle AS (
-                    SELECT COUNT(*) AS total_count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND (success IS TRUE OR success IS NULL)
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-                ),
-                active_dates AS (
-                    SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND (success IS TRUE OR success IS NULL)
-                ),
-                perf_metrics AS (
-                    SELECT
-                        AVG(duration_ms) FILTER (WHERE success IS TRUE AND duration_ms IS NOT NULL) AS avg_duration_ms,
-                        COUNT(*) FILTER (WHERE success IS NOT NULL) AS total_attempts,
-                        COUNT(*) FILTER (WHERE success IS TRUE) AS successful_attempts
-                    FROM sessions
-                    WHERE clerk_id = %s
-                )
-                SELECT
-                    (SELECT json_agg(recent) FROM recent) AS recent_sessions,
-                    (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
-                    (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
-                    (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
-                    (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days,
-                    (SELECT row_to_json(perf_metrics) FROM perf_metrics) AS performance_metrics
-            """, (
-                uid,
-                uid, current_cycle_start, current_cycle_end,
-                uid,
-                uid, prev_cycle_start, prev_cycle_end,
-                uid,
-                uid
-            ))
-        else:
-            cur.execute("""
-                WITH
-                recent AS (
-                    SELECT tool, input_summary, tokens_used,
-                           (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS created_at
-                    FROM sessions
-                    WHERE clerk_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                ),
-                weekly AS (
-                    SELECT
-                        DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date,
-                        COUNT(*) AS total_count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-                    GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-                ),
-                favorite AS (
-                    SELECT tool, COUNT(*) AS count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                    GROUP BY tool
-                    ORDER BY count DESC
-                    LIMIT 1
-                ),
-                prev_cycle AS (
-                    SELECT COUNT(*) AS total_count
-                    FROM sessions
-                    WHERE clerk_id = %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= %s
-                      AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') <= %s
-                ),
-                active_dates AS (
-                    SELECT DISTINCT DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') AS session_date
-                    FROM sessions
-                    WHERE clerk_id = %s
-                )
-                SELECT
-                    (SELECT json_agg(recent) FROM recent) AS recent_sessions,
-                    (SELECT json_agg(weekly) FROM weekly) AS weekly_metrics,
-                    (SELECT row_to_json(favorite) FROM favorite) AS favorite_tool,
-                    (SELECT total_count FROM prev_cycle) AS prev_cycle_count,
-                    (SELECT json_agg(session_date ORDER BY session_date DESC) FROM active_dates) AS active_days
-            """, (
-                uid,
-                uid, current_cycle_start, current_cycle_end,
-                uid,
-                uid, prev_cycle_start, prev_cycle_end,
-                uid
-            ))
+            result = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except Exception as cur_err:
+                print("Dashboard analytics cursor close failed:", type(cur_err).__name__)
 
-        result = cur.fetchone()
-        cur.close()
+        # Finalize read-only transaction safely before pool release
+        try:
+            conn.rollback()
+        except Exception as rb_err:
+            print("Dashboard analytics read transaction cleanup failed:", type(rb_err).__name__)
+            close_conn = True
 
         recent_sessions = result["recent_sessions"] or []
         db_metrics = result["weekly_metrics"] or []
@@ -514,12 +568,26 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print("Analytics Generation Engine Interrupted Exception:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        print("Analytics Generation Engine Interrupted Exception:", type(e).__name__)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception as rb_err:
+                print("Dashboard analytics rollback failed:", type(rb_err).__name__)
+                close_conn = True
+        raise HTTPException(
+            status_code=500,
+            detail="Database operation failed. Please try again later."
+        )
     finally:
         if conn:
-            release_db(conn)
+            if close_conn:
+                release_db(conn, close=True)
+            else:
+                release_db(conn)
 
 
 # ── Debug ────────────────────────────────────────────────

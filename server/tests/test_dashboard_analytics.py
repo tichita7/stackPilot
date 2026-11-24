@@ -1047,7 +1047,7 @@ class TestFix4FailurePathsAndExclusions:
     @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
     @patch("main.firebase_auth.verify_id_token")
     def test_dashboard_analytics_database_query_failure(self, mock_verify, mock_get_db, mock_release_db):
-        """Database failure during analytics generation returns HTTP 500 and releases connection."""
+        """Database failure during analytics generation returns HTTP 500, rolls back, and releases connection with safe message."""
         uid = "user_db_failure"
         mock_verify.return_value = {"uid": uid}
 
@@ -1063,7 +1063,9 @@ class TestFix4FailurePathsAndExclusions:
         )
 
         assert res.status_code == 500
-        assert "Database timeout on sessions query" in res.json().get("detail", "")
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "Database timeout on sessions query" not in res.text
+        mock_conn.rollback.assert_called_once()
         mock_release_db.assert_called_once_with(mock_conn)
 
     # 6. Verification that auth and input validation failures remain excluded from execution statistics
@@ -2198,4 +2200,394 @@ class TestAiToolsAuthenticationRejection:
         assert res.status_code == 503
         assert res.json().get("detail") == "Authentication verification temporarily unavailable."
         mock_get_db.assert_not_called()
+
+
+class TestDatabaseHygieneAndSafeErrors:
+    """Test suite for Fix 7A database transaction hygiene and safe error handling."""
+
+    # 1. sync_user database failure triggers rollback and returns generic HTTP 500
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="sync_fail_uid")
+    def test_sync_user_database_failure_triggers_rollback_and_safe_500(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """Database error in sync_user must trigger conn.rollback(), release conn, and return safe 500."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("syntax error at or near users")
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "a@b.com", "name": "A"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "syntax error" not in res.text
+        assert "users" not in res.json().get("detail")
+        mock_conn.rollback.assert_called_once()
+        mock_cur.close.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 2. sync_user rollback failure marks connection for discard
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="sync_rb_fail_uid")
+    def test_sync_user_rollback_failure_discards_connection(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """When conn.rollback() raises during sync_user failure, connection must be discarded with close=True."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("connection lost")
+        mock_conn.rollback.side_effect = Exception("rollback failed: broken pipe")
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "a@b.com", "name": "A"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "broken pipe" not in res.text
+        mock_conn.rollback.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn, close=True)
+
+    # 3. sync_user connection acquisition failure does not attempt rollback
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="sync_no_conn_uid")
+    def test_sync_user_connection_acquisition_failure_no_rollback(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """When get_db() raises, sync_user must return safe 500 without calling rollback or release_db on None."""
+        mock_get_db.side_effect = Exception("pool exhausted")
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "a@b.com", "name": "A"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "pool exhausted" not in res.text
+        mock_release_db.assert_not_called()
+
+    # 4. dashboard_analytics database failure triggers rollback and returns generic HTTP 500
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="dash_db_fail_uid")
+    def test_dashboard_analytics_database_failure_triggers_rollback_and_safe_500(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """Query failure in get_dashboard_analytics triggers conn.rollback(), cur.close(), and safe 500."""
+        uid = "dash_db_fail_uid"
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("relation 'sessions' does not exist")
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "relation 'sessions' does not exist" not in res.text
+        mock_conn.rollback.assert_called_once()
+        mock_cur.close.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 5. dashboard_analytics rollback failure discards connection
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="dash_rb_fail_uid")
+    def test_dashboard_analytics_rollback_failure_discards_connection(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """When conn.rollback() raises in dashboard_analytics, connection must be discarded with close=True."""
+        uid = "dash_rb_fail_uid"
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("disk full")
+        mock_conn.rollback.side_effect = Exception("rollback failed")
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "disk full" not in res.text
+        mock_conn.rollback.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn, close=True)
+
+    # 6. dashboard_analytics connection acquisition failure does not attempt rollback
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="dash_no_conn_uid")
+    def test_dashboard_analytics_connection_acquisition_failure_no_rollback(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """When get_db() raises in dashboard_analytics, returns safe 500 without calling release_db."""
+        uid = "dash_no_conn_uid"
+        mock_get_db.side_effect = Exception("connection pool timeout")
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        assert "connection pool timeout" not in res.text
+        mock_release_db.assert_not_called()
+
+    # 7. log_session query failure triggers rollback and releases connection
+    @patch("main.release_db")
+    @patch("main.get_db")
+    def test_log_session_database_failure_triggers_rollback(self, mock_get_db, mock_release_db):
+        """Query failure inside log_session must trigger conn.rollback(), cur.close(), and release_db."""
+        from main import log_session
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("deadlock detected")
+
+        log_session("user_ls_1", "debug-assistant", "err", tokens=100, duration_ms=200, success=True)
+
+        mock_conn.rollback.assert_called_once()
+        mock_cur.close.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 8. log_session rollback failure discards connection
+    @patch("main.release_db")
+    @patch("main.get_db")
+    def test_log_session_rollback_failure_discards_connection(self, mock_get_db, mock_release_db):
+        """When conn.rollback() raises in log_session, connection must be discarded with close=True."""
+        from main import log_session
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("connection lost")
+        mock_conn.rollback.side_effect = Exception("rollback failed")
+
+        log_session("user_ls_2", "debug-assistant", "err", tokens=100, duration_ms=200, success=False)
+
+        mock_conn.rollback.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn, close=True)
+
+    # 9. log_session connection acquisition failure handled safely
+    @patch("main.release_db")
+    @patch("main.get_db")
+    def test_log_session_connection_acquisition_failure_handled_safely(self, mock_get_db, mock_release_db):
+        """When get_db() raises in log_session, no exception is raised and release_db is not called."""
+        from main import log_session
+        mock_get_db.side_effect = Exception("pool exhausted")
+
+        # Must not raise
+        log_session("user_ls_3", "debug-assistant", "err", tokens=100)
+
+        mock_release_db.assert_not_called()
+
+    # 10. sync_user success commits transaction and returns expected schema
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="sync_success_uid")
+    def test_sync_user_success_preserves_commit_and_schema(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """Successful sync_user commits, closes cursor, releases conn, and returns {status, uid}."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "dev@test.com", "name": "Developer"}
+        )
+
+        assert res.status_code == 200
+        assert res.json() == {"status": "synchronized", "uid": "sync_success_uid"}
+        mock_conn.commit.assert_called_once()
+        mock_cur.close.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 11. release_db helper direct tests
+    def test_release_db_helper_behaviors(self):
+        """Direct unit test of release_db helper edge cases."""
+        from main import release_db
+        # None connection is safely ignored
+        release_db(None)
+
+        # Mock pool
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        with patch("main.connection_pool", mock_pool):
+            # Normal release
+            release_db(mock_conn)
+            mock_pool.putconn.assert_called_with(mock_conn)
+
+            # Discard release
+            release_db(mock_conn, close=True)
+            mock_pool.putconn.assert_called_with(mock_conn, close=True)
+
+        # None pool does not raise
+        with patch("main.connection_pool", None):
+            release_db(mock_conn)
+
+    # 12. Safe diagnostics sanitization prevents credential and SQL leakage
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="diag_uid")
+    def test_safe_diagnostics_sanitizes_credentials_and_sql(
+        self, mock_verify, mock_get_db, mock_release_db, capsys
+    ):
+        """Database errors with sensitive credentials/hostnames must only log exception class name."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = Exception("FATAL: password authentication failed for user 'postgres' at host 10.0.0.1")
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "a@b.com", "name": "A"}
+        )
+
+        assert res.status_code == 500
+        out = capsys.readouterr().out
+        assert "User Sync Database Error: Exception" in out
+        assert "password authentication failed" not in out
+        assert "10.0.0.1" not in out
+        assert "postgres" not in out
+
+    # 13. Successful dashboard analytics safely finalizes read transaction
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_dashboard_analytics_success_finalizes_read_transaction(
+        self, mock_verify, mock_get_db, mock_release_db
+    ):
+        """Successful dashboard query must finalize read-only transaction via rollback before pool release."""
+        uid = "dash_read_clean_uid"
+        mock_verify.return_value = {"uid": uid}
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": [],
+            "weekly_metrics": [],
+            "favorite_tool": None,
+            "prev_cycle_count": 0,
+            "active_days": [],
+            "performance_metrics": None
+        }
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        mock_conn.rollback.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 14. Dashboard analytics read transaction cleanup failure discards connection without breaking response
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_dashboard_analytics_read_transaction_cleanup_failure_discards_connection(
+        self, mock_verify, mock_get_db, mock_release_db, capsys
+    ):
+        """If read transaction rollback fails, response is preserved and connection is discarded."""
+        uid = "dash_read_fail_uid"
+        mock_verify.return_value = {"uid": uid}
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.fetchone.return_value = {
+            "recent_sessions": [],
+            "weekly_metrics": [],
+            "favorite_tool": None,
+            "prev_cycle_count": 0,
+            "active_days": [],
+            "performance_metrics": None
+        }
+        mock_conn.rollback.side_effect = RuntimeError("Broken pipe on read cleanup")
+
+        res = make_request(
+            f"/api/dashboard-analytics/{uid}",
+            headers={"Authorization": "Bearer valid_token"}
+        )
+
+        assert res.status_code == 200
+        out = capsys.readouterr().out
+        assert "Dashboard analytics read transaction cleanup failed: RuntimeError" in out
+        assert "Broken pipe on read cleanup" not in out
+        mock_release_db.assert_called_once_with(mock_conn, close=True)
+
+    # 15. Cursor close failure does not mask primary query exception
+    @patch("main.release_db")
+    @patch("main.get_db")
+    @patch("main.verify_firebase_token", return_value="mask_test_uid")
+    def test_cursor_close_failure_does_not_mask_query_exception(
+        self, mock_verify, mock_get_db, mock_release_db, capsys
+    ):
+        """When cursor close fails after query error, original error is handled and safe diagnostics logged."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_get_db.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        mock_cur.execute.side_effect = ValueError("Primary query syntax error")
+        mock_cur.close.side_effect = RuntimeError("Cursor close socket error")
+
+        res = make_post_request(
+            "/api/sync-user",
+            json_data={"id_token": "valid_token", "email": "a@b.com", "name": "A"}
+        )
+
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Database operation failed. Please try again later."
+        out = capsys.readouterr().out
+        assert "User Sync cursor close failed: RuntimeError" in out
+        assert "User Sync Database Error: ValueError" in out
+        assert "Primary query syntax error" not in out
+        assert "Cursor close socket error" not in out
+        mock_conn.rollback.assert_called_once()
+        mock_release_db.assert_called_once_with(mock_conn)
+
+    # 16. putconn failure in release_db does not leak raw exception
+    def test_putconn_failure_in_release_db_sanitized(self, capsys):
+        """Failure inside putconn logs only safe exception class name."""
+        from main import release_db
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_pool.putconn.side_effect = RuntimeError("Internal pool crash with connection dsn: postgres://user:pass@host/db")
+
+        with patch("main.connection_pool", mock_pool):
+            release_db(mock_conn)
+
+        out = capsys.readouterr().out
+        assert "Database Connection Pool Release Error: RuntimeError" in out
+        assert "postgres://user:pass@host/db" not in out
 
