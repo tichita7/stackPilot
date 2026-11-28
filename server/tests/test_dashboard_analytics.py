@@ -787,8 +787,8 @@ class TestFix4EndpointTimingAndLogging:
 
         res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash", "code": "", "language": "python"})
 
-        assert res.status_code == 200
-        assert res.json()["confidence"] == 50
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid debug analysis. Please try again."
         mock_log.assert_called_once()
         args, kwargs = mock_log.call_args
         assert kwargs["success"] is False
@@ -4040,4 +4040,445 @@ class TestRepositoryCopilotFix7CReliability:
 
         # Extra field with NaN/Inf
         assert validate_repository_copilot_response({**valid, "bad_num": float("nan")}) is False
+
+
+class TestFix7DDebugAssistantAndCodeExplainHardening:
+    """Comprehensive mocked tests for Fix 7D hardening of Debug Assistant and Code Explain."""
+
+    # ── 1. Input Validation Tests ─────────────────────────────────────────────
+    @pytest.mark.parametrize("bad_error", ["", "   ", "\t\n  "])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_input_val")
+    def test_debug_assistant_blank_error_returns_400(self, mock_verify, mock_llm, mock_log, bad_error):
+        """Blank or whitespace-only error in Debug Assistant returns 400 without calling Groq or logging."""
+        res = make_post_request(
+            "/api/debug-assistant",
+            json_data={"id_token": "token", "error": bad_error, "code": "arr[10]"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Error description is required."
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @pytest.mark.parametrize("bad_code", ["", "   ", "\t\n  "])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_input_val")
+    def test_code_explain_blank_code_returns_400(self, mock_verify, mock_llm, mock_log, bad_code):
+        """Blank or whitespace-only code in Code Explain returns 400 without calling Groq or logging."""
+        res = make_post_request(
+            "/api/code-explain",
+            json_data={"id_token": "token", "code": bad_code}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Source code is required."
+        mock_llm.assert_not_called()
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.firebase_admin._apps", {"[DEFAULT]": MagicMock()})
+    @patch("main.firebase_auth.verify_id_token")
+    def test_auth_takes_precedence_over_blank_input(self, mock_auth, mock_llm, mock_log):
+        """Authentication failure precedes input validation checks."""
+        mock_auth.side_effect = firebase_auth.InvalidIdTokenError("Invalid token")
+        res_dbg = make_post_request("/api/debug-assistant", json_data={"id_token": "bad", "error": ""})
+        assert res_dbg.status_code == 401
+
+        res_exp = make_post_request("/api/code-explain", json_data={"id_token": "bad", "code": ""})
+        assert res_exp.status_code == 401
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_opt_code")
+    def test_debug_assistant_optional_code_allowed(self, mock_verify, mock_llm, mock_log):
+        """Debug Assistant accepts empty string code when valid error description is provided."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({
+            "confidence": 85,
+            "rootCause": "Null reference exception in runtime engine",
+            "technicalExplanation": ["Null pointer access"],
+            "fixedCode": "",
+            "prevention": ["Add null checks"]
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/debug-assistant",
+            json_data={"id_token": "token", "error": "NullPointerException", "code": ""}
+        )
+        assert res.status_code == 200
+        assert res.json()["confidence"] == 85
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is True
+
+    # ── 2. Upstream Failures (HTTP 500) ───────────────────────────────────────
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_up_err")
+    def test_debug_assistant_groq_timeout_returns_500_safe(self, mock_verify, mock_llm, mock_log):
+        """Groq timeout or network failure returns 500 with safe detail and no raw credential leaks."""
+        mock_llm.side_effect = TimeoutError("Connection to https://api.groq.com timed out with token sk-leak-12345")
+
+        res = make_post_request(
+            "/api/debug-assistant",
+            json_data={"id_token": "token", "error": "crash log"}
+        )
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Debug analysis service temporarily unavailable."
+        assert "sk-leak-12345" not in res.text
+        assert "https://api.groq.com" not in res.text
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_up_err")
+    def test_code_explain_groq_timeout_returns_500_safe(self, mock_verify, mock_llm, mock_log):
+        """Groq timeout in Code Explain returns 500 with safe detail."""
+        mock_llm.side_effect = TimeoutError("Connection timed out")
+
+        res = make_post_request(
+            "/api/code-explain",
+            json_data={"id_token": "token", "code": "def foo(): pass"}
+        )
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Code explanation service temporarily unavailable."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    # ── 3. Completion Extraction Hardening (HTTP 502) ─────────────────────────
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_ext_err")
+    def test_debug_assistant_empty_choices_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Empty choices list from Groq returns 502."""
+        mock_llm.return_value = MagicMock(choices=[])
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid debug analysis. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_ext_err")
+    def test_code_explain_empty_choices_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Empty choices list from Groq in Code Explain returns 502."""
+        mock_llm.return_value = MagicMock(choices=[])
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid code explanation. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @pytest.mark.parametrize("bad_content", [None, "", "   \n\t  "])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_ext_err")
+    def test_debug_assistant_none_or_blank_content_returns_502(self, mock_verify, mock_llm, mock_log, bad_content):
+        """None or blank content from Groq returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = bad_content
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid debug analysis. Please try again."
+
+    @pytest.mark.parametrize("bad_content", [None, "", "   \n\t  "])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_ext_err")
+    def test_code_explain_none_or_blank_content_returns_502(self, mock_verify, mock_llm, mock_log, bad_content):
+        """None or blank content from Groq in Code Explain returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = bad_content
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid code explanation. Please try again."
+
+    # ── 4. Markdown Fence Normalization with Internal Backticks ───────────────
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_fence")
+    def test_debug_assistant_markdown_fences_with_internal_backticks(self, mock_verify, mock_llm, mock_log):
+        """Outer markdown fences are stripped while internal backticks and code fences in fixedCode are preserved."""
+        raw_json = json.dumps({
+            "confidence": 92,
+            "rootCause": "Error with `variable_x` in module",
+            "technicalExplanation": ["Inspect `variable_x` declaration"],
+            "fixedCode": "```python\ndef fixed_func():\n    return `val`\n```",
+            "prevention": ["Avoid using `eval()`"]
+        })
+        mock_choice = MagicMock()
+        mock_choice.message.content = f"```json\n{raw_json}\n```"
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res.status_code == 200
+        data = res.json()
+        assert "`variable_x`" in data["rootCause"]
+        assert "```python" in data["fixedCode"]
+        assert "`eval()`" in data["prevention"][0]
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_fence")
+    def test_code_explain_markdown_fences_with_internal_backticks(self, mock_verify, mock_llm, mock_log):
+        """Outer markdown fences are stripped while internal backticks in explanation are preserved."""
+        raw_json = json.dumps({
+            "summary": "Function calculates `fibonacci(n)` recursively",
+            "breakdown": ["Base case check: `if n <= 1`", "Recursive calls `fib(n-1) + fib(n-2)`"],
+            "complexity": {"time": "O(2^n)", "space": "O(n)"},
+            "improvements": ["Use memoization with `dict`"]
+        })
+        mock_choice = MagicMock()
+        mock_choice.message.content = f"```json\n{raw_json}\n```"
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def fib(n): pass"})
+        assert res.status_code == 200
+        data = res.json()
+        assert "`fibonacci(n)`" in data["summary"]
+        assert "`if n <= 1`" in data["breakdown"][0]
+
+    # ── 5. Schema and Output Validation Tests ─────────────────────────────────
+    @pytest.mark.parametrize("non_object_json", [
+        '["item1", "item2"]',
+        '"just a string"',
+        '12345',
+        'true',
+        'null',
+        '{}',
+        '{"unrelated": "data"}'
+    ])
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_schema_err")
+    def test_debug_assistant_non_object_or_unrelated_json_returns_502(self, mock_verify, mock_llm, mock_log, non_object_json):
+        """Non-object, primitive, empty, or unrelated JSON returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = non_object_json
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid debug analysis. Please try again."
+
+    @pytest.mark.parametrize("bad_conf", [-1, 101, True, False, "95", None, float("nan"), float("inf")])
+    def test_validate_debug_response_confidence_bounds(self, bad_conf):
+        """Confidence must be a finite number between 0 and 100 inclusive, not a boolean."""
+        from main import validate_debug_response
+        base = {
+            "confidence": 90,
+            "rootCause": "Valid cause",
+            "technicalExplanation": ["Point 1"],
+            "fixedCode": "code()",
+            "prevention": ["Tip 1"]
+        }
+        assert validate_debug_response({**base, "confidence": bad_conf}) is False
+
+    def test_validate_debug_response_legitimate_confidence_values(self):
+        """0, 100, and fractional confidence are accepted."""
+        from main import validate_debug_response
+        base = {
+            "confidence": 90,
+            "rootCause": "Valid cause",
+            "technicalExplanation": ["Point 1"],
+            "fixedCode": "code()",
+            "prevention": ["Tip 1"]
+        }
+        assert validate_debug_response({**base, "confidence": 0}) is True
+        assert validate_debug_response({**base, "confidence": 100}) is True
+        assert validate_debug_response({**base, "confidence": 88.5}) is True
+
+    @pytest.mark.parametrize("bad_elem_field", ["technicalExplanation", "prevention"])
+    def test_validate_debug_response_rejects_non_string_list_elements(self, bad_elem_field):
+        """Lists must not contain non-string elements (objects, numbers, nulls)."""
+        from main import validate_debug_response
+        base = {
+            "confidence": 90,
+            "rootCause": "Valid cause",
+            "technicalExplanation": ["Point 1"],
+            "fixedCode": "code()",
+            "prevention": ["Tip 1"]
+        }
+        assert validate_debug_response({**base, bad_elem_field: [{"nested": "obj"}]}) is False
+        assert validate_debug_response({**base, bad_elem_field: [123]}) is False
+        assert validate_debug_response({**base, bad_elem_field: [None]}) is False
+
+    def test_validate_explain_response_direct(self):
+        """Unit tests for validate_explain_response rules."""
+        from main import validate_explain_response
+        valid = {
+            "summary": "Valid summary of code",
+            "breakdown": ["Step 1", "Step 2"],
+            "complexity": {"time": "O(n)", "space": "O(1)"},
+            "improvements": ["Improvement tip"]
+        }
+        assert validate_explain_response(valid) is True
+
+        # Valid empty lists
+        assert validate_explain_response({**valid, "breakdown": [], "improvements": []}) is True
+
+        # Missing or blank summary
+        assert validate_explain_response({**valid, "summary": ""}) is False
+        assert validate_explain_response({**valid, "summary": "   "}) is False
+        assert validate_explain_response({**valid, "summary": 123}) is False
+
+        # Non-string array elements
+        assert validate_explain_response({**valid, "breakdown": [{"step": 1}]}) is False
+        assert validate_explain_response({**valid, "improvements": [None]}) is False
+
+        # Invalid complexity shapes
+        assert validate_explain_response({**valid, "complexity": "O(n)"}) is False
+        assert validate_explain_response({**valid, "complexity": {"time": 10, "space": "O(1)"}}) is False
+        assert validate_explain_response({**valid, "complexity": {"time": "O(n)"}}) is False  # missing space
+        assert validate_explain_response({**valid, "complexity": None}) is False
+
+        # Extra harmless fields with NaN
+        assert validate_explain_response({**valid, "extra": float("nan")}) is False
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_msg_none")
+    def test_debug_assistant_missing_message_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Missing or None message on choices object returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message = None
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid debug analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_msg_none")
+    def test_code_explain_missing_message_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Missing or None message on choices object in Code Explain returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message = None
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid code explanation. Please try again."
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_non_str")
+    def test_endpoints_reject_non_string_content_502(self, mock_verify, mock_llm, mock_log):
+        """Non-string content types (int, list, dict) return 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = 12345
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_dbg = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "crash"})
+        assert res_dbg.status_code == 502
+
+        res_exp = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res_exp.status_code == 502
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_unrel_exp")
+    def test_code_explain_unrelated_or_missing_summary_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Code Explain with unrelated JSON or missing summary returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({"unrelated": "data"})
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid code explanation. Please try again."
+
+        # Missing summary
+        mock_choice.message.content = json.dumps({
+            "breakdown": ["Step 1"],
+            "complexity": {"time": "O(1)", "space": "O(1)"},
+            "improvements": []
+        })
+        res2 = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res2.status_code == 502
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_comp_err")
+    def test_code_explain_invalid_complexity_returns_502(self, mock_verify, mock_llm, mock_log):
+        """Code Explain with non-dict complexity or non-string time/space returns 502."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({
+            "summary": "Valid summary",
+            "breakdown": ["Step 1"],
+            "complexity": "O(n)",  # string instead of dict
+            "improvements": []
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "def foo(): pass"})
+        assert res.status_code == 502
+
+    def test_strict_serialization_rejects_surrogates_and_nan(self):
+        """Strict response serialization rejects unpaired surrogates and NaN in extra fields."""
+        from main import validate_debug_response, validate_explain_response
+
+        valid_dbg = {
+            "confidence": 90,
+            "rootCause": "Valid cause",
+            "technicalExplanation": ["Point 1"],
+            "fixedCode": "code()",
+            "prevention": ["Tip 1"]
+        }
+        # Unpaired surrogate code point
+        assert validate_debug_response({**valid_dbg, "surrogate": "\ud800"}) is False
+        # Nested NaN
+        assert validate_debug_response({**valid_dbg, "extra_nested": {"val": float("nan")}}) is False
+
+        valid_exp = {
+            "summary": "Valid summary",
+            "breakdown": ["Step 1"],
+            "complexity": {"time": "O(n)", "space": "O(1)"},
+            "improvements": ["Tip 1"]
+        }
+        assert validate_explain_response({**valid_exp, "surrogate": "\ud800"}) is False
+        assert validate_explain_response({**valid_exp, "extra_nested": {"val": float("inf")}}) is False
+
+    @patch("main.log_session")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_log_fail")
+    def test_logging_failure_preserves_original_response_debug_and_explain(self, mock_verify, mock_llm, mock_log):
+        """Session audit logging failure does not replace or crash successful 200 responses."""
+        mock_log.side_effect = RuntimeError("Database audit connection failure")
+
+        mock_choice_dbg = MagicMock()
+        mock_choice_dbg.message.content = json.dumps({
+            "confidence": 95,
+            "rootCause": "Valid root cause",
+            "technicalExplanation": [],
+            "fixedCode": "",
+            "prevention": []
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice_dbg])
+
+        res_dbg = make_post_request("/api/debug-assistant", json_data={"id_token": "token", "error": "IndexError"})
+        assert res_dbg.status_code == 200
+        assert res_dbg.json()["confidence"] == 95
+
+        mock_choice_exp = MagicMock()
+        mock_choice_exp.message.content = json.dumps({
+            "summary": "Valid summary",
+            "breakdown": [],
+            "complexity": {"time": "O(1)", "space": "O(1)"},
+            "improvements": []
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice_exp])
+
+        res_exp = make_post_request("/api/code-explain", json_data={"id_token": "token", "code": "x = 10"})
+        assert res_exp.status_code == 200
+        assert res_exp.json()["summary"] == "Valid summary"
 

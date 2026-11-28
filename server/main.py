@@ -591,12 +591,121 @@ async def get_dashboard_analytics(uid: str, authorization: Optional[str] = Heade
                 release_db(conn)
 
 
+def check_finite_numbers(val) -> bool:
+    """Recursively verifies that no float values are NaN or Infinity."""
+    if isinstance(val, bool):
+        return True
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return False
+        return True
+    if isinstance(val, dict):
+        return all(check_finite_numbers(v) for v in val.values())
+    if isinstance(val, list):
+        return all(check_finite_numbers(item) for item in val)
+    return True
+
+
+def validate_debug_response(data) -> bool:
+    """
+    Validates that parsed LLM output conforms to the expected debug analysis shape:
+    - Root must be a non-empty dictionary.
+    - All numeric values (including any harmless extra fields) must be finite (not NaN/Inf).
+    - 'confidence' must be int or float (not bool), finite, between 0 and 100 inclusive.
+    - 'rootCause' must be a non-empty, non-whitespace string.
+    - 'fixedCode' must be a string (empty string is permitted).
+    - 'technicalExplanation' and 'prevention' must be lists where every element is a string.
+    - The entire payload must be safely serializable to JSON.
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+
+    if not check_finite_numbers(data):
+        return False
+
+    conf = data.get("confidence")
+    if isinstance(conf, bool) or not isinstance(conf, (int, float)):
+        return False
+    if math.isnan(conf) or math.isinf(conf):
+        return False
+    if not (0 <= conf <= 100):
+        return False
+
+    rc = data.get("rootCause")
+    if not isinstance(rc, str) or not rc.strip():
+        return False
+
+    fc = data.get("fixedCode")
+    if not isinstance(fc, str):
+        return False
+
+    for list_field in ("technicalExplanation", "prevention"):
+        val = data.get(list_field)
+        if not isinstance(val, list):
+            return False
+        if not all(isinstance(item, str) for item in val):
+            return False
+
+    try:
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except Exception:
+        return False
+
+    return True
+
+
+def validate_explain_response(data) -> bool:
+    """
+    Validates that parsed LLM output conforms to the expected code explanation shape:
+    - Root must be a non-empty dictionary.
+    - All numeric values (including any harmless extra fields) must be finite (not NaN/Inf).
+    - 'summary' must be a non-empty, non-whitespace string.
+    - 'breakdown' and 'improvements' must be lists where every element is a string.
+    - 'complexity' must be a dictionary containing 'time' and 'space', both strings.
+    - The entire payload must be safely serializable to JSON.
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+
+    if not check_finite_numbers(data):
+        return False
+
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+
+    for list_field in ("breakdown", "improvements"):
+        val = data.get(list_field)
+        if not isinstance(val, list):
+            return False
+        if not all(isinstance(item, str) for item in val):
+            return False
+
+    comp = data.get("complexity")
+    if not isinstance(comp, dict):
+        return False
+    time_val = comp.get("time")
+    space_val = comp.get("space")
+    if not isinstance(time_val, str) or not isinstance(space_val, str):
+        return False
+
+    try:
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except Exception:
+        return False
+
+    return True
+
+
 # ── Debug ────────────────────────────────────────────────
 @app.post("/api/debug-assistant")
 async def debug(req: DebugRequest):
     uid = verify_firebase_token(req.id_token)
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
+
+    if not isinstance(req.error, str) or not req.error.strip():
+        raise HTTPException(status_code=400, detail="Error description is required.")
 
     start_time = time.perf_counter()
     outcome_success = False
@@ -614,32 +723,76 @@ async def debug(req: DebugRequest):
 Rules: Return ONLY JSON. confidence = 0-100. fixedCode = compilable code only. No markdown fences."""
         }
         user_content = f"Language: {req.language}\nError:\n{req.error}\nCode:\n{req.code}"
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[system_message, {"role": "user", "content": user_content}]
-        )
-        content = response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[system_message, {"role": "user", "content": user_content}]
+            )
+        except HTTPException:
+            raise
+        except Exception as upstream_err:
+            print("Debug Assistant Groq Upstream Error:", type(upstream_err).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Debug analysis service temporarily unavailable."
+            )
+
+        choices = getattr(response, "choices", None)
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid debug analysis. Please try again."
+            )
+        first_choice = choices[0]
+        message = getattr(first_choice, "message", None)
+        if not message:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid debug analysis. Please try again."
+            )
+        raw_content = getattr(message, "content", None)
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid debug analysis. Please try again."
+            )
+        content = raw_content.strip()
+
         if content.startswith("```"):
-            content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+            fence_match = re.match(r"^```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)\s*```$", content, re.DOTALL)
+            if fence_match:
+                content = fence_match.group(1).strip()
 
         try:
-            data = json.loads(content)
-            outcome_success = True
-            return data
-        except Exception:
-            return {
-                "confidence": 50,
-                "rootCause": "Unable to analyze error context due to formatting mismatch.",
-                "technicalExplanation": [],
-                "fixedCode": "",
-                "prevention": []
-            }
+            content_data = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid debug analysis. Please try again."
+            )
+
+        if not validate_debug_response(content_data):
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid debug analysis. Please try again."
+            )
+
+        outcome_success = True
+        return content_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Debug Assistant Internal Error:", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Debug analysis service temporarily unavailable."
+        )
     finally:
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         try:
             log_session(uid, "debug-assistant", req.error[:100], tokens=240, duration_ms=duration_ms, success=outcome_success)
         except Exception as log_err:
-            print("Session Audit Logger Interrupted:", log_err)
+            print("Session Audit Logger Interrupted:", type(log_err).__name__)
 
 
 # ── Code Explain ─────────────────────────────────────────
@@ -648,6 +801,9 @@ async def explain(req: CodeRequest):
     uid = verify_firebase_token(req.id_token)
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication token required. Please sign in.")
+
+    if not isinstance(req.code, str) or not req.code.strip():
+        raise HTTPException(status_code=400, detail="Source code is required.")
 
     start_time = time.perf_counter()
     outcome_success = False
@@ -686,31 +842,76 @@ Rules:
 """
         }
         user_content = f"Language: {req.language}\nCode:\n{req.code}"
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[system_message, {"role": "user", "content": user_content}]
-        )
-        content = response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[system_message, {"role": "user", "content": user_content}]
+            )
+        except HTTPException:
+            raise
+        except Exception as upstream_err:
+            print("Code Explain Groq Upstream Error:", type(upstream_err).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Code explanation service temporarily unavailable."
+            )
+
+        choices = getattr(response, "choices", None)
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid code explanation. Please try again."
+            )
+        first_choice = choices[0]
+        message = getattr(first_choice, "message", None)
+        if not message:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid code explanation. Please try again."
+            )
+        raw_content = getattr(message, "content", None)
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid code explanation. Please try again."
+            )
+        content = raw_content.strip()
+
         if content.startswith("```"):
-            content = re.sub(r"```\w*", "", content).replace("```", "").strip()
+            fence_match = re.match(r"^```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)\s*```$", content, re.DOTALL)
+            if fence_match:
+                content = fence_match.group(1).strip()
 
         try:
-            data = json.loads(content)
-            outcome_success = True
-            return data
-        except Exception:
-            return {
-                "summary": "Unable to compile structural breakdown",
-                "breakdown": [],
-                "complexity": {"time": "-", "space": "-"},
-                "improvements": []
-            }
+            content_data = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid code explanation. Please try again."
+            )
+
+        if not validate_explain_response(content_data):
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid code explanation. Please try again."
+            )
+
+        outcome_success = True
+        return content_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Code Explain Internal Error:", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Code explanation service temporarily unavailable."
+        )
     finally:
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         try:
             log_session(uid, "code-explain", req.code[:100], tokens=180, duration_ms=duration_ms, success=outcome_success)
         except Exception as log_err:
-            print("Session Audit Logger Interrupted:", log_err)
+            print("Session Audit Logger Interrupted:", type(log_err).__name__)
 
 
 def validate_resume_analysis(data) -> bool:
@@ -852,21 +1053,6 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
             log_session(uid, "review-resume", "ATS Upload Optimization Analysis", tokens=310, duration_ms=duration_ms, success=outcome_success)
         except Exception as log_err:
             print("Session Audit Logger Interrupted:", type(log_err).__name__)
-
-
-def check_finite_numbers(val) -> bool:
-    """Recursively verifies that no float values are NaN or Infinity."""
-    if isinstance(val, bool):
-        return True
-    if isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
-            return False
-        return True
-    if isinstance(val, dict):
-        return all(check_finite_numbers(v) for v in val.values())
-    if isinstance(val, list):
-        return all(check_finite_numbers(item) for item in val)
-    return True
 
 
 def validate_repository_copilot_response(data: dict) -> bool:

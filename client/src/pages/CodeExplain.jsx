@@ -36,7 +36,7 @@ const CodeExplain = () => {
 
   const handleAnalyze = async (e) => {
     e?.preventDefault();
-    if (!code) return;
+    if (!code || !code.trim()) return;
 
     setLoading(true);
     setError(null);
@@ -72,18 +72,78 @@ const CodeExplain = () => {
       );
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => null);
         if (response.status === 401) {
-          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          const detail = typeof errData?.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
           throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
         }
-        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+        if (response.status === 503 && errData?.detail === "Authentication verification temporarily unavailable.") {
           throw new Error("Authentication verification temporarily unavailable.");
+        }
+        const detail = typeof errData?.detail === "string" ? errData.detail.trim() : "";
+        if (response.status === 400) {
+          if (detail === "Source code is required.") {
+            throw new Error(detail);
+          }
+          throw new Error("Source code is required.");
+        }
+        if (response.status === 502) {
+          if (detail === "Unable to generate a valid code explanation. Please try again.") {
+            throw new Error(detail);
+          }
+          throw new Error("Unable to generate a valid code explanation. Please try again.");
+        }
+        if (response.status === 500) {
+          if (detail === "Code explanation service temporarily unavailable.") {
+            throw new Error(detail);
+          }
+          throw new Error("Code explanation service temporarily unavailable.");
         }
         throw new Error("Backend connection failed.");
       }
 
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("Backend connection failed.");
+      }
+
+      // Backward-compatibility: legacy HTTP 200 failure check
+      if (
+        typeof data.summary === "string" &&
+        data.summary.trim() === "Unable to compile structural breakdown"
+      ) {
+        throw new Error("Unable to generate a valid code explanation. Please try again.");
+      }
+
+      // Validate fields consumed by React:
+      if (typeof data.summary !== "string" || !data.summary.trim()) {
+        throw new Error("Unable to generate a valid code explanation. Please try again.");
+      }
+
+      if (
+        !Array.isArray(data.breakdown) ||
+        !data.breakdown.every((item) => typeof item === "string")
+      ) {
+        throw new Error("Unable to generate a valid code explanation. Please try again.");
+      }
+
+      if (
+        !data.complexity ||
+        typeof data.complexity !== "object" ||
+        Array.isArray(data.complexity) ||
+        typeof data.complexity.time !== "string" ||
+        typeof data.complexity.space !== "string"
+      ) {
+        throw new Error("Unable to generate a valid code explanation. Please try again.");
+      }
+
+      if (
+        !Array.isArray(data.improvements) ||
+        !data.improvements.every((item) => typeof item === "string")
+      ) {
+        throw new Error("Unable to generate a valid code explanation. Please try again.");
+      }
 
       setResult(data);
       setActiveTab("overview");

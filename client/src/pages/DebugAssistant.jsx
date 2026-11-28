@@ -37,7 +37,7 @@ const DebugAssistant = () => {
 
   const handleAnalyze = async (e) => {
     e?.preventDefault();
-    if (!errorLog) return;
+    if (!errorLog || !errorLog.trim()) return;
 
     setLoading(true);
     setError(null);
@@ -74,18 +74,82 @@ const DebugAssistant = () => {
       );
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => null);
         if (response.status === 401) {
-          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          const detail = typeof errData?.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
           throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
         }
-        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+        if (response.status === 503 && errData?.detail === "Authentication verification temporarily unavailable.") {
           throw new Error("Authentication verification temporarily unavailable.");
+        }
+        const detail = typeof errData?.detail === "string" ? errData.detail.trim() : "";
+        if (response.status === 400) {
+          if (detail === "Error description is required.") {
+            throw new Error(detail);
+          }
+          throw new Error("Error description is required.");
+        }
+        if (response.status === 502) {
+          if (detail === "Unable to generate a valid debug analysis. Please try again.") {
+            throw new Error(detail);
+          }
+          throw new Error("Unable to generate a valid debug analysis. Please try again.");
+        }
+        if (response.status === 500) {
+          if (detail === "Debug analysis service temporarily unavailable.") {
+            throw new Error(detail);
+          }
+          throw new Error("Debug analysis service temporarily unavailable.");
         }
         throw new Error("Telemetry validation diagnostic failure.");
       }
 
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("Telemetry validation diagnostic failure.");
+      }
+
+      // Backward-compatibility: legacy HTTP 200 formatting failure check
+      if (
+        typeof data.rootCause === "string" &&
+        data.rootCause.trim() === "Unable to analyze error context due to formatting mismatch."
+      ) {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
+
+      // Validate fields consumed by React:
+      if (
+        typeof data.confidence !== "number" ||
+        Number.isNaN(data.confidence) ||
+        !Number.isFinite(data.confidence) ||
+        data.confidence < 0 ||
+        data.confidence > 100
+      ) {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
+
+      if (typeof data.rootCause !== "string" || !data.rootCause.trim()) {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
+
+      if (
+        !Array.isArray(data.technicalExplanation) ||
+        !data.technicalExplanation.every((item) => typeof item === "string")
+      ) {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
+
+      if (typeof data.fixedCode !== "string") {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
+
+      if (
+        !Array.isArray(data.prevention) ||
+        !data.prevention.every((item) => typeof item === "string")
+      ) {
+        throw new Error("Unable to generate a valid debug analysis. Please try again.");
+      }
 
       setResult(data);
       setActiveTab("overview");
@@ -420,7 +484,7 @@ const DebugAssistant = () => {
                         borderRadius: 4,
                       }}
                     >
-                      CONFIDENCE: {result.confidence || 50}%
+                      CONFIDENCE: {result.confidence}%
                     </div>
                   </div>
                   <p
