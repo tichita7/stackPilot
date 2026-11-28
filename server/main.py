@@ -854,6 +854,70 @@ Rules: Return ONLY JSON. No markdown. Score 0-100."""
             print("Session Audit Logger Interrupted:", type(log_err).__name__)
 
 
+def check_finite_numbers(val) -> bool:
+    """Recursively verifies that no float values are NaN or Infinity."""
+    if isinstance(val, bool):
+        return True
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return False
+        return True
+    if isinstance(val, dict):
+        return all(check_finite_numbers(v) for v in val.values())
+    if isinstance(val, list):
+        return all(check_finite_numbers(item) for item in val)
+    return True
+
+
+def validate_repository_copilot_response(data: dict) -> bool:
+    """
+    Validates that a repository analysis payload conforms to the required output shape:
+    - Root must be a dict.
+    - 'overview' must be a non-empty string.
+    - 'tech_stack', 'important_files', and 'quick_start' must be lists where every element is a string.
+    - 'developer_insights' must be a dict where every value is a string.
+    - 'change_plan' must be a dict containing 'files_to_modify' (list of strings) and 'steps' (list of strings).
+    - Harmless extra fields are permitted provided they do not contain NaN or Infinity.
+    - Valid empty lists are permitted.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    if not check_finite_numbers(data):
+        return False
+
+    overview = data.get("overview")
+    if not isinstance(overview, str) or not overview.strip():
+        return False
+
+    for list_field in ("tech_stack", "important_files", "quick_start"):
+        val = data.get(list_field)
+        if not isinstance(val, list):
+            return False
+        if not all(isinstance(item, str) for item in val):
+            return False
+
+    insights = data.get("developer_insights")
+    if not isinstance(insights, dict):
+        return False
+    if not all(isinstance(v, str) for v in insights.values()):
+        return False
+
+    change_plan = data.get("change_plan")
+    if not isinstance(change_plan, dict):
+        return False
+
+    files_to_modify = change_plan.get("files_to_modify")
+    if not isinstance(files_to_modify, list) or not all(isinstance(f, str) for f in files_to_modify):
+        return False
+
+    steps = change_plan.get("steps")
+    if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+        return False
+
+    return True
+
+
 # ── Repository Copilot ────────────────────────────────────
 def normalize_repo_path(raw_path: str) -> str:
     """
@@ -893,7 +957,10 @@ async def repository_copilot(req: RepoRequest):
 
     parsed = parse_github_url(req.repo_url)
     if not parsed:
-        return {"error": "Invalid GitHub repository location format. Use https://github.com/owner/repo"}
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub repository location format. Use https://github.com/owner/repo"
+        )
 
     owner, repo = parsed
 
@@ -903,14 +970,53 @@ async def repository_copilot(req: RepoRequest):
         github_token = os.getenv("GITHUB_TOKEN")
         ctx = fetch_repository_context(owner, repo, goal=req.goal, github_token=github_token)
 
-        if ctx.access_denied:
-            raise Exception("GitHub API access denied. The repository is private or rate limited.")
+        if ctx.upstream_status == 401:
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub service temporarily unavailable. Please try again."
+            )
 
-        if ctx.rate_limited:
-            raise Exception("GitHub API rate limit exceeded. Please configure GITHUB_TOKEN or retry later.")
+        if ctx.failure_reason == "not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="GitHub repository not found or is private."
+            )
+
+        if ctx.failure_reason == "access_denied":
+            raise HTTPException(
+                status_code=403,
+                detail="GitHub repository access is restricted."
+            )
+
+        if ctx.failure_reason == "rate_limited":
+            raise HTTPException(
+                status_code=429,
+                detail="GitHub request limit reached. Please try again later."
+            )
+
+        if ctx.failure_reason == "timeout":
+            raise HTTPException(
+                status_code=504,
+                detail="GitHub request timed out. Please try again."
+            )
+
+        if ctx.failure_reason in ("network_error", "upstream_error"):
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub service temporarily unavailable. Please try again."
+            )
+
+        if ctx.failure_reason == "malformed_response":
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to retrieve valid repository information from GitHub."
+            )
 
         if ctx.error_message and not ctx.is_empty:
-            raise Exception(ctx.error_message)
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub service temporarily unavailable. Please try again."
+            )
 
         if ctx.is_empty:
             outcome_success = True
@@ -970,22 +1076,133 @@ CRITICAL RULES:
         repository_context_str = ctx.to_prompt_context()
         user_content = f"User Goal: {req.goal if req.goal else 'Provide a general architectural overview and map key components.'}\n\n{repository_context_str}"
 
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[system_message, {"role": "user", "content": user_content}],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
+        try:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[system_message, {"role": "user", "content": user_content}],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+        except HTTPException:
+            raise
+        except Exception as upstream_err:
+            print("Repository Copilot Groq Upstream Error:", type(upstream_err).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Repository analysis service temporarily unavailable."
+            )
 
-        raw_content = response.choices[0].message.content.strip()
-        if raw_content.startswith("```"):
-            raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content)
-            raw_content = re.sub(r"\s*```$", "", raw_content)
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
+        message = getattr(choices[0], "message", None)
+        raw_content = getattr(message, "content", None)
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
+        content = raw_content.strip()
+
+        # Safely normalize enclosing Markdown fences without stripping backticks from JSON values
+        if content.startswith("```"):
+            fence_match = re.match(r"^```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)\s*```$", content, re.DOTALL)
+            if fence_match:
+                content = fence_match.group(1).strip()
 
         try:
-            content_data = json.loads(raw_content)
+            content_data = json.loads(content)
         except json.JSONDecodeError:
-            raise Exception("LLM failed to generate parseable JSON.")
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
+
+        # Raw model output validation:
+        if not isinstance(content_data, dict) or not content_data:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
+
+        # Overview is strictly required and must be a non-empty string
+        raw_overview = content_data.get("overview")
+        if not isinstance(raw_overview, str) or not raw_overview.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
+        content_data["overview"] = raw_overview.strip()
+
+        # Validate types of optional fields when provided
+        if "tech_stack" in content_data:
+            if not isinstance(content_data["tech_stack"], list) or not all(isinstance(t, str) for t in content_data["tech_stack"]):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+        else:
+            content_data["tech_stack"] = list(ctx.languages.keys())[:5] if ctx.languages else ["General"]
+
+        if "important_files" in content_data:
+            if not isinstance(content_data["important_files"], list) or not all(isinstance(f, str) for f in content_data["important_files"]):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+        else:
+            content_data["important_files"] = []
+
+        if "quick_start" in content_data:
+            if not isinstance(content_data["quick_start"], list) or not all(isinstance(q, str) for q in content_data["quick_start"]):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+            if not content_data["quick_start"]:
+                content_data["quick_start"] = [f"git clone https://github.com/{owner}/{repo}.git"]
+        else:
+            content_data["quick_start"] = [f"git clone https://github.com/{owner}/{repo}.git"]
+
+        if "developer_insights" in content_data:
+            if not isinstance(content_data["developer_insights"], dict) or not all(isinstance(v, str) for v in content_data["developer_insights"].values()):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+        else:
+            content_data["developer_insights"] = {
+                "architecture": "Architecture details unavailable.",
+                "routing": "Routing details unavailable.",
+                "state_management": "State management details unavailable."
+            }
+
+        if "change_plan" in content_data:
+            if not isinstance(content_data["change_plan"], dict):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+            cp = content_data["change_plan"]
+            if "files_to_modify" in cp and (not isinstance(cp["files_to_modify"], list) or not all(isinstance(f, str) for f in cp["files_to_modify"])):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+            if "steps" in cp and (not isinstance(cp["steps"], list) or not all(isinstance(s, str) for s in cp["steps"])):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to generate a valid repository analysis. Please try again."
+                )
+            if "files_to_modify" not in cp:
+                cp["files_to_modify"] = []
+            if "steps" not in cp:
+                cp["steps"] = []
+        else:
+            content_data["change_plan"] = {"files_to_modify": [], "steps": []}
 
         # Build verified paths set from retrieved context (full inventory if available, directory tree preview, selected files)
         candidate_source = ctx.all_file_paths if getattr(ctx, "all_file_paths", None) else ctx.directory_tree
@@ -994,64 +1211,39 @@ CRITICAL RULES:
         verified_paths.discard("")
 
         # Deterministic backend validation of important_files against verified paths
-        if not isinstance(content_data.get("important_files"), list):
-            content_data["important_files"] = []
-        else:
-            validated_files = []
-            for f in content_data["important_files"]:
-                clean_f = normalize_repo_path(f)
-                if clean_f and clean_f in verified_paths and clean_f not in validated_files:
-                    validated_files.append(clean_f)
-            # If all were hallucinated or none matched, fallback to verified selected files
-            if not validated_files and ctx.selected_files:
-                validated_files = [normalize_repo_path(k) for k in ctx.selected_files.keys() if normalize_repo_path(k)]
-            content_data["important_files"] = validated_files
+        validated_files = []
+        for f in content_data["important_files"]:
+            clean_f = normalize_repo_path(f)
+            if clean_f and clean_f in verified_paths and clean_f not in validated_files:
+                validated_files.append(clean_f)
+        # If all were hallucinated or none matched, fallback to verified selected files
+        if not validated_files and ctx.selected_files:
+            validated_files = [normalize_repo_path(k) for k in ctx.selected_files.keys() if normalize_repo_path(k)]
+        content_data["important_files"] = validated_files
 
         # Deterministic backend validation of change_plan
-        if not isinstance(content_data.get("change_plan"), dict):
-            content_data["change_plan"] = {"files_to_modify": [], "steps": []}
-        else:
-            cp = content_data["change_plan"]
-            if not isinstance(cp.get("files_to_modify"), list):
-                cp["files_to_modify"] = []
-            else:
-                validated_mods = []
-                for f in cp["files_to_modify"]:
-                    clean_f = normalize_repo_path(f)
-                    if clean_f and clean_f in verified_paths and clean_f not in validated_mods:
-                        validated_mods.append(clean_f)
-                cp["files_to_modify"] = validated_mods
+        cp = content_data["change_plan"]
+        validated_mods = []
+        for f in cp["files_to_modify"]:
+            clean_f = normalize_repo_path(f)
+            if clean_f and clean_f in verified_paths and clean_f not in validated_mods:
+                validated_mods.append(clean_f)
+        cp["files_to_modify"] = validated_mods
 
-            if not isinstance(cp.get("steps"), list):
-                cp["steps"] = []
-            else:
-                cleaned_steps = []
-                for s in cp["steps"]:
-                    if isinstance(s, str) and s.strip():
-                        clean_s = re.sub(r"^(?:\*\*Step\s+\d+:\*\*|\d+[\.\)]|\bStep\s+\d+:?)\s*", "", s.strip(), flags=re.IGNORECASE).strip()
-                        if clean_s:
-                            cleaned_steps.append(clean_s)
-                cp["steps"] = cleaned_steps
+        cleaned_steps = []
+        for s in cp["steps"]:
+            if isinstance(s, str) and s.strip():
+                clean_s = re.sub(r"^(?:\*\*Step\s+\d+:\*\*|\d+[\.\)]|\bStep\s+\d+:?)\s*", "", s.strip(), flags=re.IGNORECASE).strip()
+                if clean_s:
+                    cleaned_steps.append(clean_s)
+        cp["steps"] = cleaned_steps
 
-        # Normalize tech_stack
-        if not isinstance(content_data.get("tech_stack"), list):
-            content_data["tech_stack"] = list(ctx.languages.keys())[:5] if ctx.languages else ["General"]
-
-        # Normalize quick_start (safe fallback if list is missing, not a list, or empty)
-        if not isinstance(content_data.get("quick_start"), list) or not content_data["quick_start"]:
-            content_data["quick_start"] = [f"git clone https://github.com/{owner}/{repo}.git"]
-
-        # Normalize developer_insights
-        if not isinstance(content_data.get("developer_insights"), dict):
-            content_data["developer_insights"] = {
-                "architecture": "Architecture details unavailable.",
-                "routing": "Routing details unavailable.",
-                "state_management": "State management details unavailable."
-            }
-
-        # Normalize overview
-        if not isinstance(content_data.get("overview"), str) or not content_data["overview"].strip():
-            content_data["overview"] = f"Repository {owner}/{repo} analyzed."
+        # Final response validation
+        if not validate_repository_copilot_response(content_data):
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to generate a valid repository analysis. Please try again."
+            )
 
         outcome_success = True
         return content_data
@@ -1059,17 +1251,14 @@ CRITICAL RULES:
     except HTTPException:
         raise
     except Exception as e:
-        return {
-            "overview": f"Analysis failed. Reason: {str(e)}",
-            "tech_stack": ["Error"],
-            "important_files": [],
-            "quick_start": [],
-            "developer_insights": {},
-            "change_plan": {}
-        }
+        print("Repository Copilot Internal Error:", type(e).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Repository analysis failed. Please try again later."
+        )
     finally:
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         try:
             log_session(uid, "repository-copilot", req.repo_url, tokens=450, duration_ms=duration_ms, success=outcome_success)
         except Exception as log_err:
-            print("Session Audit Logger Interrupted:", log_err)
+            print("Session Audit Logger Interrupted:", type(log_err).__name__)

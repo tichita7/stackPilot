@@ -511,3 +511,155 @@ class TestFetchRepositoryContext:
         assert "Passed file content" in ctx.selected_files["b_pass.py"]
         assert ctx.total_api_calls <= MAX_GITHUB_REQUESTS
         assert mock_get.call_count <= MAX_GITHUB_REQUESTS
+
+
+class TestStructuredFailureClassification:
+    """Tests for Fix 7C structured failure classification on RepositoryContext."""
+
+    @patch("github_service.requests.get")
+    def test_structured_rate_limit_403(self, mock_get):
+        mock_res = MagicMock(status_code=403, text="rate limit exceeded")
+        mock_res.headers = {"X-RateLimit-Remaining": "0"}
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "rate_limited"
+        assert ctx.upstream_status == 403
+        assert ctx.rate_limited is True
+
+    @patch("github_service.requests.get")
+    def test_structured_rate_limit_429(self, mock_get):
+        mock_res = MagicMock(status_code=429, text="Too Many Requests")
+        mock_res.headers = {}
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "rate_limited"
+        assert ctx.upstream_status == 429
+        assert ctx.rate_limited is True
+
+    @patch("github_service.requests.get")
+    def test_structured_access_denied_403(self, mock_get):
+        mock_res = MagicMock(status_code=403, text="Forbidden")
+        mock_res.headers = {"X-RateLimit-Remaining": "60"}
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "access_denied"
+        assert ctx.upstream_status == 403
+        assert ctx.access_denied is True
+
+    @patch("github_service.requests.get")
+    def test_structured_not_found_404(self, mock_get):
+        mock_res = MagicMock(status_code=404)
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "not_found"
+        assert ctx.upstream_status == 404
+        assert ctx.access_denied is True
+
+    @patch("github_service.requests.get")
+    def test_structured_upstream_500(self, mock_get):
+        mock_res = MagicMock(status_code=500)
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "upstream_error"
+        assert ctx.upstream_status == 500
+
+    @patch("github_service.requests.get")
+    def test_structured_timeout(self, mock_get):
+        mock_get.side_effect = requests.Timeout("Gateway timed out")
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "timeout"
+        assert ctx.upstream_status is None
+
+    @patch("github_service.requests.get")
+    def test_structured_network_error(self, mock_get):
+        mock_get.side_effect = requests.ConnectionError("Connection refused")
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "network_error"
+        assert ctx.upstream_status is None
+
+    @patch("github_service.requests.get")
+    def test_structured_malformed_json(self, mock_get):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.side_effect = ValueError("Invalid JSON")
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "malformed_response"
+        assert ctx.upstream_status == 200
+
+    @patch("github_service.requests.get")
+    def test_structured_upstream_401(self, mock_get):
+        mock_res = MagicMock(status_code=401, text="Bad credentials")
+        mock_res.headers = {}
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "upstream_error"
+        assert ctx.upstream_status == 401
+
+    @pytest.mark.parametrize("bad_metadata", [
+        None,
+        [],
+        "string",
+        123,
+    ])
+    @patch("github_service.requests.get")
+    def test_structured_malformed_metadata_non_dict(self, mock_get, bad_metadata):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.return_value = bad_metadata
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "malformed_response"
+        assert ctx.upstream_status == 200
+
+    @pytest.mark.parametrize("missing_keys_metadata", [
+        {},
+        {"description": "No name or full_name or id", "size": 100},
+    ])
+    @patch("github_service.requests.get")
+    def test_structured_malformed_metadata_missing_essential_keys(self, mock_get, missing_keys_metadata):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.return_value = missing_keys_metadata
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "malformed_response"
+        assert ctx.upstream_status == 200
+
+    @pytest.mark.parametrize("bad_size_metadata", [
+        {"name": "repo", "size": True},
+        {"name": "repo", "size": False},
+        {"name": "repo", "size": "100"},
+        {"name": "repo", "size": None},
+        {"name": "repo", "size": -5},
+    ])
+    @patch("github_service.requests.get")
+    def test_structured_malformed_metadata_invalid_size(self, mock_get, bad_size_metadata):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.return_value = bad_size_metadata
+        mock_get.return_value = mock_res
+
+        ctx = fetch_repository_context("owner", "repo")
+        assert ctx.failure_reason == "malformed_response"
+        assert ctx.upstream_status == 200
+
+    @patch("github_service.requests.get")
+    def test_client_last_failure_type_reset(self, mock_get):
+        from github_service import GitHubApiClient
+        client = GitHubApiClient()
+        client.last_failure_type = "network_error"
+
+        mock_res = MagicMock(status_code=200)
+        mock_get.return_value = mock_res
+
+        res = client.safe_get("https://api.github.com/repos/owner/repo")
+        assert res is not None
+        assert client.last_failure_type is None

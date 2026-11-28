@@ -14,7 +14,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from fastapi import HTTPException
-from main import app, normalize_repo_path, verify_firebase_token, validate_resume_analysis
+from main import app, normalize_repo_path, verify_firebase_token, validate_resume_analysis, validate_repository_copilot_response
 from firebase_admin import auth as firebase_auth
 
 
@@ -883,14 +883,14 @@ class TestFix4EndpointTimingAndLogging:
     @patch("main.log_session")
     @patch("main.verify_firebase_token", return_value="user_repo")
     def test_repository_copilot_invalid_url_excludes_logging(self, mock_verify, mock_log):
-        """Input validation failure on invalid repo url returns error and excludes logging."""
+        """Input validation failure on invalid repo url returns HTTP 400 and excludes logging."""
         res = make_post_request(
             "/api/repository-copilot",
             json_data={"id_token": "token", "repo_url": "invalid-url", "goal": "Analyze"}
         )
 
-        assert res.status_code == 200
-        assert "Invalid GitHub repository location format" in res.json().get("error", "")
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid GitHub repository location format. Use https://github.com/owner/repo"
         mock_log.assert_not_called()
 
     @patch("main.log_session")
@@ -970,9 +970,9 @@ class TestFix4FailurePathsAndExclusions:
     @patch("github_service.requests.get")
     @patch("main.verify_firebase_token", return_value="user_repo_err")
     def test_repository_copilot_github_403_failure(self, mock_verify, mock_get, mock_log):
-        """GitHub API 403 in repo copilot logs success=False, preserves error format, returns 200 with error overview."""
+        """GitHub API 403 access denied logs success=False and returns HTTP 403."""
         mock_res = MagicMock(status_code=403, text="forbidden")
-        mock_res.headers = {}
+        mock_res.headers = {"X-RateLimit-Remaining": "60"}
         mock_get.return_value = mock_res
 
         res = make_post_request(
@@ -980,11 +980,8 @@ class TestFix4FailurePathsAndExclusions:
             json_data={"id_token": "token", "repo_url": "https://github.com/private/repo", "goal": "Analyze"}
         )
 
-        assert res.status_code == 200
-        data = res.json()
-        assert "GitHub API access denied" in data.get("overview", "")
-        assert data.get("tech_stack") == ["Error"]
-        assert data.get("important_files") == []
+        assert res.status_code == 403
+        assert res.json().get("detail") == "GitHub repository access is restricted."
         mock_log.assert_called_once()
         args, kwargs = mock_log.call_args
         assert args[0] == "user_repo_err"
@@ -997,7 +994,7 @@ class TestFix4FailurePathsAndExclusions:
     @patch("github_service.requests.get")
     @patch("main.verify_firebase_token", return_value="user_repo_err")
     def test_repository_copilot_github_404_failure(self, mock_verify, mock_get, mock_log):
-        """GitHub API 404 in repo copilot logs success=False, preserves error format, returns 200 with error overview."""
+        """GitHub API 404 in repo copilot logs success=False and returns HTTP 404."""
         mock_res = MagicMock(status_code=404)
         mock_get.return_value = mock_res
 
@@ -1006,10 +1003,8 @@ class TestFix4FailurePathsAndExclusions:
             json_data={"id_token": "token", "repo_url": "https://github.com/missing/repo", "goal": "Analyze"}
         )
 
-        assert res.status_code == 200
-        data = res.json()
-        assert "GitHub API access denied" in data.get("overview", "")
-        assert data.get("tech_stack") == ["Error"]
+        assert res.status_code == 404
+        assert res.json().get("detail") == "GitHub repository not found or is private."
         mock_log.assert_called_once()
         args, kwargs = mock_log.call_args
         assert args[0] == "user_repo_err"
@@ -1391,7 +1386,7 @@ class TestRepositoryCopilotGroundingIntegration:
     @patch("github_service.requests.get")
     @patch("main.verify_firebase_token", return_value="user_rate")
     def test_rate_limit_exceeded_handled_cleanly(self, mock_verify, mock_get, mock_log):
-        """Rate limit response returns error overview and logs success=False."""
+        """Rate limit response returns HTTP 429 and logs success=False."""
         mock_res = MagicMock(status_code=403, text="rate limit exceeded")
         mock_res.headers = {"X-RateLimit-Remaining": "0"}
         mock_get.return_value = mock_res
@@ -1401,10 +1396,8 @@ class TestRepositoryCopilotGroundingIntegration:
             json_data={"id_token": "token", "repo_url": "https://github.com/test/rate-limited"}
         )
 
-        assert res.status_code == 200
-        data = res.json()
-        assert "rate limit" in data["overview"].lower()
-        assert data["tech_stack"] == ["Error"]
+        assert res.status_code == 429
+        assert res.json().get("detail") == "GitHub request limit reached. Please try again later."
         mock_log.assert_called_once()
         assert mock_log.call_args[1]["success"] is False
 
@@ -1413,7 +1406,7 @@ class TestRepositoryCopilotGroundingIntegration:
     @patch("main.client.chat.completions.create")
     @patch("main.verify_firebase_token", return_value="user_json_err")
     def test_llm_json_decode_error_fallback(self, mock_verify, mock_llm, mock_get, mock_log):
-        """When LLM returns non-JSON, fallback structure is returned and success=False logged."""
+        """When LLM returns non-JSON, HTTP 502 is returned and success=False logged."""
         mock_repo = MagicMock(status_code=200)
         mock_repo.json.return_value = {"name": "test-repo", "default_branch": "main", "size": 100}
         mock_langs = MagicMock(status_code=200)
@@ -1436,10 +1429,8 @@ class TestRepositoryCopilotGroundingIntegration:
             json_data={"id_token": "token", "repo_url": "https://github.com/test/test-repo"}
         )
 
-        assert res.status_code == 200
-        data = res.json()
-        assert "Analysis failed" in data["overview"]
-        assert data["tech_stack"] == ["Error"]
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
         mock_log.assert_called_once()
         assert mock_log.call_args[1]["success"] is False
 
@@ -3468,4 +3459,585 @@ class TestResumeReviewPdfAndLlmReliability:
             "extra_field": "harmless",
             "metadata": {"version": 1}
         }) is True
+
+
+class TestRepositoryCopilotFix7CReliability:
+    """Mocked regression test suite for Fix 7C Repository Copilot reliability, error contracts, and validation."""
+
+    # 1. URL validation tests returning HTTP 400 and excluding logging
+    @patch("main.log_session")
+    @patch("main.verify_firebase_token", return_value="user_url_val")
+    def test_repository_copilot_empty_url_returns_400(self, mock_verify, mock_log):
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "   ", "goal": "Analyze"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid GitHub repository location format. Use https://github.com/owner/repo"
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.verify_firebase_token", return_value="user_url_val")
+    def test_repository_copilot_non_github_url_returns_400(self, mock_verify, mock_log):
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://gitlab.com/owner/repo", "goal": "Analyze"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid GitHub repository location format. Use https://github.com/owner/repo"
+        mock_log.assert_not_called()
+
+    @patch("main.log_session")
+    @patch("main.verify_firebase_token", return_value="user_url_val")
+    def test_repository_copilot_malicious_traversal_url_returns_400(self, mock_verify, mock_log):
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/../evil", "goal": "Analyze"}
+        )
+        assert res.status_code == 400
+        assert res.json().get("detail") == "Invalid GitHub repository location format. Use https://github.com/owner/repo"
+        mock_log.assert_not_called()
+
+    # 2. GitHub failure classifications
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_github_timeout_returns_504(self, mock_verify, mock_get, mock_log):
+        import requests
+        mock_get.side_effect = requests.Timeout("Gateway connection timed out")
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/timeout-repo"}
+        )
+        assert res.status_code == 504
+        assert res.json().get("detail") == "GitHub request timed out. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_github_connection_error_returns_502(self, mock_verify, mock_get, mock_log):
+        import requests
+        mock_get.side_effect = requests.ConnectionError("Connection refused by peer")
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/conn-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "GitHub service temporarily unavailable. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_github_500_upstream_returns_502(self, mock_verify, mock_get, mock_log):
+        mock_res = MagicMock(status_code=500)
+        mock_get.return_value = mock_res
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/500-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "GitHub service temporarily unavailable. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_github_malformed_json_returns_502(self, mock_verify, mock_get, mock_log):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.side_effect = ValueError("Invalid JSON stream from GitHub")
+        mock_get.return_value = mock_res
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/badjson-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to retrieve valid repository information from GitHub."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_upstream_github_401_returns_502(self, mock_verify, mock_get, mock_log):
+        mock_res = MagicMock(status_code=401, text="Bad credentials")
+        mock_res.headers = {}
+        mock_get.return_value = mock_res
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/badtoken-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "GitHub service temporarily unavailable. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.verify_firebase_token", return_value="user_gh_err")
+    def test_repository_copilot_malformed_github_metadata_returns_502(self, mock_verify, mock_get, mock_log):
+        mock_res = MagicMock(status_code=200)
+        mock_res.json.return_value = {}  # missing essential keys (name, full_name, id)
+        mock_get.return_value = mock_res
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/owner/missingkeys-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to retrieve valid repository information from GitHub."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    # 3. Groq SDK / Network outage returning 500 without leaking raw details
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_outage")
+    def test_repository_copilot_groq_upstream_outage_returns_500(self, mock_verify, mock_llm, mock_get, mock_log):
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "groq-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+        mock_llm.side_effect = RuntimeError("APIConnectionError: connection timeout to https://api.groq.com/v1 with token sk-secret-12345")
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/groq-outage"}
+        )
+        assert res.status_code == 500
+        assert res.json().get("detail") == "Repository analysis service temporarily unavailable."
+        assert "APIConnectionError" not in res.text
+        assert "sk-secret-12345" not in res.text
+        assert "https://api.groq.com" not in res.text
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    # 4. Groq output structure failures returning 502
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_struct")
+    def test_repository_copilot_empty_choices_returns_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "choices-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+        mock_llm.return_value = MagicMock(choices=[])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/choices-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_struct")
+    def test_repository_copilot_none_content_returns_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "none-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        # Test None content
+        mock_choice = MagicMock()
+        mock_choice.message.content = None
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_none = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/none-repo"}
+        )
+        assert res_none.status_code == 502
+        assert res_none.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_struct")
+    def test_repository_copilot_whitespace_content_returns_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "none-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        # Test whitespace content
+        mock_choice = MagicMock()
+        mock_choice.message.content = "   \n\t  "
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_ws = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/none-repo"}
+        )
+        assert res_ws.status_code == 502
+        assert res_ws.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_struct")
+    def test_repository_copilot_non_object_json_returns_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "array-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        # Returns JSON array instead of object
+        mock_choice = MagicMock()
+        mock_choice.message.content = '["item1", "item2"]'
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/array-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_groq_struct")
+    def test_repository_copilot_empty_dict_rejected_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Empty JSON object {} is rejected as unmeaningful analysis."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "empty-json", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "{}"
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/empty-json"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    # 5. Analysis validation rejecting invalid elements
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_val_err")
+    def test_repository_copilot_non_string_array_elements_rejected_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Objects in tech_stack or nested dicts in insights are rejected with 502 preventing React crashes."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "bad-elems", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        # Dict in tech_stack
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({
+            "overview": "Overview",
+            "tech_stack": [{"name": "React"}],
+            "important_files": ["main.py"],
+            "quick_start": ["python main.py"],
+            "developer_insights": {},
+            "change_plan": {"files_to_modify": ["main.py"], "steps": ["Step 1"]}
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res_dict_tech = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/bad-elems"}
+        )
+        assert res_dict_tech.status_code == 502
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_val_err")
+    def test_repository_copilot_missing_overview_rejected_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Unrelated JSON payload missing overview is rejected with 502."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "unrelated-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({"unrelated": "hello"})
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/unrelated-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is False
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_val_err")
+    def test_repository_copilot_whitespace_overview_rejected_502_direct(self, mock_verify, mock_llm, mock_get, mock_log):
+        """JSON payload with whitespace-only overview is rejected with 502."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "wso-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({"overview": "   \n\t  "})
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/wso-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_val_err")
+    def test_repository_copilot_invalid_developer_insights_type_rejected_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Non-dict developer_insights provided by model is rejected with 502."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "badi-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({
+            "overview": "Valid overview",
+            "developer_insights": "string instead of dict"
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/badi-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_val_err")
+    def test_repository_copilot_invalid_change_plan_steps_type_rejected_502(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Non-list change_plan steps provided by model is rejected with 502."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "badcp-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps({
+            "overview": "Valid overview",
+            "change_plan": {"steps": "single step string"}
+        })
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/badcp-repo"}
+        )
+        assert res.status_code == 502
+        assert res.json().get("detail") == "Unable to generate a valid repository analysis. Please try again."
+
+    # 6. Markdown fence stripping with internal backticks preserved
+    @patch("main.log_session")
+    @patch("github_service.requests.get")
+    @patch("main.client.chat.completions.create")
+    @patch("main.verify_firebase_token", return_value="user_fence")
+    def test_repository_copilot_markdown_fences_with_internal_backticks(self, mock_verify, mock_llm, mock_get, mock_log):
+        """Enclosing markdown code fences are stripped while internal backticks in overview are preserved."""
+        mock_repo = MagicMock(status_code=200)
+        mock_repo.json.return_value = {"name": "fence-repo", "default_branch": "main", "size": 100}
+        mock_langs = MagicMock(status_code=200)
+        mock_langs.json.return_value = {}
+        mock_readme = MagicMock(status_code=404)
+        mock_tree = MagicMock(status_code=200)
+        mock_tree.json.return_value = {"tree": [{"path": "main.py", "type": "blob", "size": 50}]}
+        mock_file = MagicMock(status_code=200)
+        mock_file.json.return_value = {"encoding": "base64", "content": base64.b64encode(b"pass").decode()}
+
+        mock_get.side_effect = [mock_repo, mock_langs, mock_readme, mock_tree, mock_file]
+
+        raw_json = json.dumps({
+            "overview": "Project uses `main.py` as primary entrypoint and `config.json` for settings.",
+            "tech_stack": ["Python"],
+            "important_files": ["main.py"],
+            "quick_start": ["python main.py"],
+            "developer_insights": {"architecture": "Modular"},
+            "change_plan": {"files_to_modify": ["main.py"], "steps": ["Inspect code"]}
+        })
+        mock_choice = MagicMock()
+        mock_choice.message.content = f"```json\n{raw_json}\n```"
+        mock_llm.return_value = MagicMock(choices=[mock_choice])
+
+        res = make_post_request(
+            "/api/repository-copilot",
+            json_data={"id_token": "token", "repo_url": "https://github.com/test/fence-repo"}
+        )
+        assert res.status_code == 200
+        assert "`main.py`" in res.json()["overview"]
+        mock_log.assert_called_once()
+        assert mock_log.call_args[1]["success"] is True
+
+    # 7. Direct unit tests for validate_repository_copilot_response
+    def test_validate_repository_copilot_response_direct(self):
+        import math
+        from main import validate_repository_copilot_response, check_finite_numbers
+
+        # check_finite_numbers tests
+        assert check_finite_numbers(123) is True
+        assert check_finite_numbers(45.6) is True
+        assert check_finite_numbers(True) is True
+        assert check_finite_numbers(False) is True
+        assert check_finite_numbers(float("nan")) is False
+        assert check_finite_numbers(float("inf")) is False
+        assert check_finite_numbers(float("-inf")) is False
+        assert check_finite_numbers({"nested": [1, float("nan")]}) is False
+
+        # validate_repository_copilot_response tests
+        assert validate_repository_copilot_response(None) is False
+        assert validate_repository_copilot_response("not a dict") is False
+        assert validate_repository_copilot_response([]) is False
+        assert validate_repository_copilot_response({}) is False
+
+        valid = {
+            "overview": "Overview text",
+            "tech_stack": ["Python"],
+            "important_files": ["main.py"],
+            "quick_start": ["python main.py"],
+            "developer_insights": {"arch": "MVC"},
+            "change_plan": {"files_to_modify": ["main.py"], "steps": ["Step 1"]}
+        }
+        assert validate_repository_copilot_response(valid) is True
+
+        # Valid empty lists
+        valid_empty = {
+            "overview": "Overview",
+            "tech_stack": [],
+            "important_files": [],
+            "quick_start": [],
+            "developer_insights": {},
+            "change_plan": {"files_to_modify": [], "steps": []}
+        }
+        assert validate_repository_copilot_response(valid_empty) is True
+
+        # Extra harmless fields
+        assert validate_repository_copilot_response({**valid, "extra": "data"}) is True
+
+        # Missing / invalid overview
+        assert validate_repository_copilot_response({**valid, "overview": ""}) is False
+        assert validate_repository_copilot_response({**valid, "overview": 123}) is False
+        assert validate_repository_copilot_response({**valid, "overview": {"nested": "dict"}}) is False
+
+        # Non-string array elements
+        assert validate_repository_copilot_response({**valid, "tech_stack": [{"nested": 1}]}) is False
+        assert validate_repository_copilot_response({**valid, "tech_stack": [123]}) is False
+        assert validate_repository_copilot_response({**valid, "important_files": [None]}) is False
+        assert validate_repository_copilot_response({**valid, "quick_start": [True]}) is False
+
+        # Non-string insight values
+        assert validate_repository_copilot_response({**valid, "developer_insights": {"arch": {"sub": "obj"}}}) is False
+        assert validate_repository_copilot_response({**valid, "developer_insights": {"arch": 123}}) is False
+
+        # Non-string change_plan elements
+        assert validate_repository_copilot_response({**valid, "change_plan": {"files_to_modify": [123], "steps": ["S1"]}}) is False
+        assert validate_repository_copilot_response({**valid, "change_plan": {"files_to_modify": ["f"], "steps": [None]}}) is False
+
+        # Extra field with NaN/Inf
+        assert validate_repository_copilot_response({**valid, "bad_num": float("nan")}) is False
 

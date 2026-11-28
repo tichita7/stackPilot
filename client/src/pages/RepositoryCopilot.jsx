@@ -71,20 +71,91 @@ const RepositoryCopilot = () => {
       );
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => null);
         if (response.status === 401) {
-          const detail = typeof errData.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
+          const detail = typeof errData?.detail === "string" && errData.detail.trim() ? errData.detail.trim() : "";
           throw new Error(detail || "Your session has expired or is invalid. Please sign in again.");
         }
-        if (response.status === 503 && errData.detail === "Authentication verification temporarily unavailable.") {
+        if (response.status === 503 && errData?.detail === "Authentication verification temporarily unavailable.") {
           throw new Error("Authentication verification temporarily unavailable.");
+        }
+        const detail = typeof errData?.detail === "string" ? errData.detail.trim() : "";
+
+        if (response.status === 400) {
+          if (detail === "Invalid GitHub repository location format. Use https://github.com/owner/repo") {
+            throw new Error(detail);
+          }
+          throw new Error("Invalid GitHub repository location format. Use https://github.com/owner/repo");
+        }
+        if (response.status === 403) {
+          if (detail === "GitHub repository access is restricted.") {
+            throw new Error(detail);
+          }
+          throw new Error("GitHub repository access is restricted.");
+        }
+        if (response.status === 404) {
+          if (detail === "GitHub repository not found or is private.") {
+            throw new Error(detail);
+          }
+          throw new Error("GitHub repository not found or is private.");
+        }
+        if (response.status === 429) {
+          if (detail === "GitHub request limit reached. Please try again later.") {
+            throw new Error(detail);
+          }
+          throw new Error("GitHub request limit reached. Please try again later.");
+        }
+        if (response.status === 504) {
+          if (detail === "GitHub request timed out. Please try again.") {
+            throw new Error(detail);
+          }
+          throw new Error("GitHub request timed out. Please try again.");
+        }
+        if (response.status === 502) {
+          if (
+            detail === "GitHub service temporarily unavailable. Please try again." ||
+            detail === "Unable to retrieve valid repository information from GitHub." ||
+            detail === "Unable to generate a valid repository analysis. Please try again."
+          ) {
+            throw new Error(detail);
+          }
+          throw new Error("GitHub service temporarily unavailable. Please try again.");
+        }
+        if (response.status === 500) {
+          if (
+            detail === "Repository analysis service temporarily unavailable." ||
+            detail === "Repository analysis failed. Please try again later."
+          ) {
+            throw new Error(detail);
+          }
+          throw new Error("Repository analysis service temporarily unavailable.");
         }
         throw new Error("Failed to map repository.");
       }
 
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
 
-      if (data.error) throw new Error(data.error);
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("Failed to map repository.");
+      }
+
+      // Backward-compatibility: legacy HTTP 200 error payload check
+      if (typeof data.error === "string" && data.error.trim()) {
+        const errStr = data.error.trim();
+        if (errStr === "Invalid GitHub repository location format. Use https://github.com/owner/repo") {
+          throw new Error(errStr);
+        }
+        throw new Error("Failed to map repository.");
+      }
+
+      // Backward-compatibility: legacy HTTP 200 analysis failure payload check
+      if (typeof data.overview === "string" && data.overview.startsWith("Analysis failed.")) {
+        throw new Error("Unable to generate a valid repository analysis. Please try again.");
+      }
+
+      if (typeof data.overview !== "string" || !data.overview.trim()) {
+        throw new Error("Failed to map repository.");
+      }
 
       setResult(data);
       setActiveTab("overview");

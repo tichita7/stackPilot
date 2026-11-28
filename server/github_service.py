@@ -148,6 +148,8 @@ class RepositoryContext:
     all_file_paths: Set[str] = field(default_factory=set)
     selected_files: Dict[str, str] = field(default_factory=dict)
     error_message: Optional[str] = None
+    failure_reason: Optional[str] = None
+    upstream_status: Optional[int] = None
 
     def to_prompt_context(self) -> str:
         """Serializes repository context into a bounded, prompt-safe text block."""
@@ -475,6 +477,7 @@ class GitHubApiClient:
     def __init__(self, github_token: Optional[str] = None):
         self.github_token = github_token
         self.request_count = 0
+        self.last_failure_type: Optional[str] = None
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {
@@ -487,17 +490,23 @@ class GitHubApiClient:
 
     def safe_get(self, url: str) -> Optional[requests.Response]:
         """Executes a bounded GET request respecting the request budget and security boundaries."""
+        self.last_failure_type = None
+
         if self.request_count >= MAX_GITHUB_REQUESTS:
+            self.last_failure_type = "budget_exhausted"
             return None
 
         # Verify target URL is strictly on api.github.com
         try:
             parsed = urllib.parse.urlsplit(url)
             if (parsed.hostname or "").lower() != "api.github.com":
+                self.last_failure_type = "invalid_url"
                 return None
             if parsed.scheme.lower() != "https":
+                self.last_failure_type = "invalid_url"
                 return None
         except Exception:
+            self.last_failure_type = "invalid_url"
             return None
 
         self.request_count += 1
@@ -509,7 +518,14 @@ class GitHubApiClient:
                 allow_redirects=False  # Prevent redirecting away from api.github.com
             )
             return response
+        except requests.Timeout:
+            self.last_failure_type = "timeout"
+            return None
         except requests.RequestException:
+            self.last_failure_type = "network_error"
+            return None
+        except Exception:
+            self.last_failure_type = "network_error"
             return None
 
 
@@ -532,7 +548,23 @@ def fetch_repository_context(
     context.total_api_calls = client.request_count
 
     if repo_res is None:
-        context.error_message = "GitHub API request timed out or network connection failed."
+        if client.last_failure_type == "timeout":
+            context.failure_reason = "timeout"
+            context.error_message = "GitHub API request timed out."
+        elif client.last_failure_type == "budget_exhausted":
+            context.failure_reason = "upstream_error"
+            context.error_message = "GitHub API request budget exceeded."
+        else:
+            context.failure_reason = "network_error"
+            context.error_message = "GitHub API request timed out or network connection failed."
+        return context
+
+    context.upstream_status = repo_res.status_code
+
+    if repo_res.status_code == 429:
+        context.rate_limited = True
+        context.failure_reason = "rate_limited"
+        context.error_message = "GitHub API rate limit exceeded. Please configure GITHUB_TOKEN or retry later."
         return context
 
     if repo_res.status_code in (401, 403):
@@ -542,30 +574,63 @@ def fetch_repository_context(
         body_text = repo_res.text if hasattr(repo_res, "text") and isinstance(repo_res.text, str) else ""
         if remaining == "0" or "rate limit" in body_text.lower():
             context.rate_limited = True
+            context.failure_reason = "rate_limited"
             context.error_message = "GitHub API rate limit exceeded. Please configure GITHUB_TOKEN or retry later."
+        elif repo_res.status_code == 401:
+            context.failure_reason = "upstream_error"
+            context.error_message = "GitHub API authentication failed."
         else:
             context.access_denied = True
+            context.failure_reason = "access_denied"
             context.error_message = "GitHub API access denied. The repository is private or access is restricted."
         return context
 
     if repo_res.status_code == 404:
         context.access_denied = True
+        context.failure_reason = "not_found"
         context.error_message = "GitHub repository not found or is private."
         return context
 
+    if repo_res.status_code >= 500:
+        context.failure_reason = "upstream_error"
+        context.error_message = f"GitHub API responded with unexpected status code: {repo_res.status_code}."
+        return context
+
     if repo_res.status_code != 200:
+        context.failure_reason = "upstream_error"
         context.error_message = f"GitHub API responded with unexpected status code: {repo_res.status_code}."
         return context
 
     try:
         repo_data = repo_res.json()
     except Exception:
+        context.failure_reason = "malformed_response"
         context.error_message = "Malformed JSON received from GitHub API."
         return context
 
-    default_branch = repo_data.get("default_branch") or "main"
+    if not isinstance(repo_data, dict):
+        context.failure_reason = "malformed_response"
+        context.error_message = "Malformed repository metadata received from GitHub API."
+        return context
+
+    # Check essential metadata (name or full_name or id or default_branch)
+    if not any(k in repo_data for k in ("name", "full_name", "id", "default_branch")):
+        context.failure_reason = "malformed_response"
+        context.error_message = "Missing essential repository metadata."
+        return context
+
+    raw_branch = repo_data.get("default_branch")
+    default_branch = raw_branch if isinstance(raw_branch, str) and raw_branch.strip() else "main"
     context.default_branch = default_branch
-    repo_size = repo_data.get("size", 0)
+
+    raw_size = repo_data.get("size")
+    # size must be an integer, not a boolean, and non-negative
+    if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
+        context.failure_reason = "malformed_response"
+        context.error_message = "Invalid repository size in metadata."
+        return context
+
+    repo_size = raw_size
 
     # Check for empty repository
     if repo_size == 0:
@@ -577,7 +642,9 @@ def fetch_repository_context(
     langs_res = client.safe_get(langs_url)
     if langs_res and langs_res.status_code == 200:
         try:
-            context.languages = langs_res.json()
+            parsed_langs = langs_res.json()
+            if isinstance(parsed_langs, dict):
+                context.languages = parsed_langs
         except Exception:
             context.languages = {}
 
@@ -587,7 +654,7 @@ def fetch_repository_context(
     if readme_res and readme_res.status_code == 200:
         try:
             readme_data = readme_res.json()
-            if "content" in readme_data:
+            if isinstance(readme_data, dict) and "content" in readme_data and isinstance(readme_data["content"], str):
                 decoded_readme = base64.b64decode(readme_data["content"]).decode("utf-8", errors="ignore")
                 context.readme_content = sanitize_and_truncate(decoded_readme, MAX_README_CHARS)
         except Exception:
@@ -608,12 +675,14 @@ def fetch_repository_context(
     if tree_res and tree_res.status_code == 200:
         try:
             tree_data = tree_res.json()
-            context.tree_truncated = bool(tree_data.get("truncated", False))
-            tree_entries = tree_data.get("tree", [])
-            # Extract top-level paths for preview and retain full inventory for path validation
-            blob_paths = [e["path"] for e in tree_entries if e.get("type") == "blob"]
-            context.directory_tree = blob_paths[:MAX_TREE_PREVIEW_PATHS]
-            context.all_file_paths = set(blob_paths)
+            if isinstance(tree_data, dict):
+                context.tree_truncated = bool(tree_data.get("truncated", False))
+                raw_tree = tree_data.get("tree", [])
+                if isinstance(raw_tree, list):
+                    tree_entries = [e for e in raw_tree if isinstance(e, dict)]
+                    blob_paths = [e["path"] for e in tree_entries if e.get("type") == "blob" and isinstance(e.get("path"), str)]
+                    context.directory_tree = blob_paths[:MAX_TREE_PREVIEW_PATHS]
+                    context.all_file_paths = set(blob_paths)
         except Exception:
             tree_entries = []
 
@@ -637,7 +706,7 @@ def fetch_repository_context(
         if file_res and file_res.status_code == 200:
             try:
                 file_data = file_res.json()
-                if "content" in file_data and file_data.get("encoding") == "base64":
+                if isinstance(file_data, dict) and "content" in file_data and isinstance(file_data["content"], str) and file_data.get("encoding") == "base64":
                     decoded_file = base64.b64decode(file_data["content"]).decode("utf-8", errors="ignore")
                     context.selected_files[path] = sanitize_and_truncate(decoded_file, MAX_FILE_CHARS)
             except Exception:
